@@ -1,0 +1,15 @@
+[package]
+name = "arc-rate-limit"
+version.workspace = true
+edition = "2021"
+license = "Apache-2.0"
+publish = false
+
+[features]
+default = []
+# 说明：
+# - 无锁限流器（原子 CAS）。
+# - 算法使用 GCRA（等价 token-bucket 的一种实现），只需单个 atomic 状态，性能更好。
+
+[dependencies]
+arc-common = { path = "../arc-common" }

@@ -1,0 +1,14 @@
+[package]
+name = "arc-global-rate-limit"
+version.workspace = true
+edition = "2021"
+license = "Apache-2.0"
+publish = false
+
+[features]
+default = []
+redis = ["dep:redis"]
+
+[dependencies]
+tokio = { version = "1", features = ["rt-multi-thread", "sync", "time", "net"] }
+redis = { version = "0.25", optional = true, default-features = false, features = ["tokio-comp", "connection-manager", "script"] }

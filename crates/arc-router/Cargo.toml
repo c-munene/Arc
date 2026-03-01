@@ -1,0 +1,15 @@
+[package]
+name = "arc-router"
+version.workspace = true
+edition = "2021"
+license = "Apache-2.0"
+publish = false
+
+[features]
+default = []
+# 说明：
+# - Radix Tree 路由匹配实现。
+# - 不引入动态参数提取（避免热路径分配）。支持 exact 与 prefix-wildcard。
+
+[dependencies]
+arc-common = { path = "../arc-common" }

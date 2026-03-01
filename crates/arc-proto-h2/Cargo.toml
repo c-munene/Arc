@@ -1,0 +1,13 @@
+[package]
+name = "arc-proto-h2"
+version.workspace = true
+edition = "2021"
+license = "Apache-2.0"
+publish = false
+
+[features]
+default = []
+
+[dependencies]
+bytes = "1"
+hpack = "0.3"

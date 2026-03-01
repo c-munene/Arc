@@ -1,0 +1,14 @@
+[package]
+name = "arc-common"
+version.workspace = true
+edition = "2021"
+license = "Apache-2.0"
+publish = false
+
+[features]
+default = []
+# 说明：
+# - 本 crate 只提供统一错误类型与 Result alias。
+# - 不提供默认 feature，避免无意义的依赖扩张。
+
+[dependencies]

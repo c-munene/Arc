@@ -1,0 +1,18 @@
+[package]
+name = "arc-xdp-userspace"
+version.workspace = true
+edition = "2021"
+license = "Apache-2.0"
+
+[dependencies]
+arc-common = { path = "../arc-common" }
+arc-config = { path = "../arc-config" }
+arc-xdp-common = { path = "../arc-xdp-common" }
+arc-swap = "1"
+aya = "0.13.1"
+
+libc = "0.2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+humantime = "2"
+tokio = { version = "1", features = ["rt", "rt-multi-thread", "time", "sync", "macros"] }

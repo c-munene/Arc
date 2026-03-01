@@ -1,0 +1,17 @@
+[package]
+name = "arc-observability"
+version.workspace = true
+edition = "2021"
+license = "Apache-2.0"
+publish = false
+
+[features]
+default = ["admin"]
+admin = []
+# 说明：
+# - admin feature 提供 /metrics & /healthz。
+# - 若你要嵌入到更大系统，可关闭 admin，仅保留 metrics structs。
+
+[dependencies]
+arc-common = { path = "../arc-common" }
+arc-logging = { path = "../arc-logging" }

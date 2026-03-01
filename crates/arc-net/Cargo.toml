@@ -1,0 +1,16 @@
+[package]
+name = "arc-net"
+version.workspace = true
+edition = "2021"
+license = "Apache-2.0"
+publish = false
+
+[features]
+default = []
+# 说明：
+# - arc-net 聚焦 io_uring + socket + CPU affinity。
+# - 不引入 async runtime，不引入上层语义。
+
+[dependencies]
+libc = "0.2"
+arc-common = { path = "../arc-common" }

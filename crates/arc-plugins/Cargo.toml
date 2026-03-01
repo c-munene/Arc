@@ -1,0 +1,19 @@
+[package]
+name = "arc-plugins"
+version.workspace = true
+edition = "2021"
+license = "Apache-2.0"
+publish = false
+
+[features]
+default = ["wasm"]
+wasm = []
+# 说明：
+# - wasm feature 默认开启：Arc 插件链以 WASM 优先。
+# - 若你想完全禁用插件链，可在顶层关闭默认 feature。
+
+[dependencies]
+arc-common = { path = "../arc-common" }
+
+# Wasmtime: 版本范围使用主版本号，避免过度绑定 patch；若你内部有更严格的版本要求可改为精确版本。
+wasmtime = { version = "19", default-features = true }

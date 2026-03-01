@@ -1,0 +1,22 @@
+[package]
+name = "arc-compression"
+version.workspace = true
+edition = "2021"
+license = "Apache-2.0"
+publish = false
+
+[dependencies]
+arc-common = { path = "../arc-common" }
+
+# lock-free pool
+crossbeam-queue = "0.3"
+
+# gzip streaming (raw deflate) + zlib backend
+flate2 = { version = "1", default-features = false, features = ["zlib"] }
+crc32fast = "1"
+
+# zstd streaming (CCtx + compress_stream2)
+zstd-safe = "7"
+
+# brotli streaming writer (flush) + internal encoder state
+brotli = "3"

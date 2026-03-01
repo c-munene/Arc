@@ -1,0 +1,29 @@
+[package]
+name = "arc-xdp"
+version.workspace = true
+edition = "2021"
+license = "Dual MIT/GPL"
+publish = false
+
+[dependencies]
+aya-ebpf = { version = "0.1.1" }
+arc-xdp-common = { path = "../arc-xdp-common", default-features = false, features = ["bpf"] }
+
+[[bin]]
+name = "arc_xdp"
+path = "src/main.rs"
+
+[lib]
+path = "src/lib.rs"
+
+[profile.dev]
+panic = "abort"
+opt-level = 2
+lto = true
+codegen-units = 1
+
+[profile.release]
+panic = "abort"
+opt-level = "z"
+lto = true
+codegen-units = 1

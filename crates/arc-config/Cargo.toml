@@ -1,0 +1,29 @@
+[package]
+name = "arc-config"
+version.workspace = true
+edition = "2021"
+license = "Apache-2.0"
+publish = false
+
+[features]
+default = ["json", "toml", "yaml"]
+json = []
+toml = []
+yaml = []
+
+[dependencies]
+arc-common = { path = "../arc-common" }
+arc-router = { path = "../arc-router" }
+arc-rate-limit = { path = "../arc-rate-limit" }
+arc-plugins = { path = "../arc-plugins" }
+
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+toml = "0.8"
+serde_yaml = "0.9"
+bytes = "1"
+regex = "1"
+humantime-serde = "1"
+humantime = "2"
+
+arc-swap = "1"

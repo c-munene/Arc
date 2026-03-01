@@ -1,0 +1,71 @@
+# Rust / Cargo
+/target/
+/target-*/
+**/*.rs.bk
+
+# Build outputs
+/dist/
+
+# Logs / runtime artifacts
+*.log
+*.pid
+*.out.log
+*.err.log
+
+# Environment / local cache
+.ruff_cache/
+.vscode/
+.idea/
+
+# OS artifacts
+.DS_Store
+Thumbs.db
+
+# Cargo
+Cargo.lock
+
+# Temp / test artifacts
+tmp/
+dist/
+rpitit_test
+
+# Rust artifacts
+target-*/
+*.rlib
+*.rmeta
+*.bpf.o
+
+# Benchmark results (keep structure)
+benchmark/results/*
+!benchmark/results/.gitkeep
+
+# Logs
+*.log
+*.pid
+
+# Certs
+*.pem
+*.key
+*.crt
+*.p12
+!*.example.pem
+
+# Env
+.env
+.env.*
+
+# OS
+.DS_Store
+Thumbs.db
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Temp docs
+jc.md
+xdp.md
+zip.md
+key_modules_export*.txt

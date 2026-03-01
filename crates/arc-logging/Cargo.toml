@@ -1,0 +1,21 @@
+[package]
+name = "arc-logging"
+version.workspace = true
+edition = "2021"
+license = "Apache-2.0"
+
+[features]
+default = []
+# 调试日志：生产构建不启用该feature时，相关代码/符号不会进入二进制（零开销）
+debug_log = []
+
+[dependencies]
+arc-swap = "1.7"
+crossbeam-channel = "0.5"
+crossbeam-utils = "0.8"
+flate2 = "1.0"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+time = { version = "0.3", features = ["formatting"] }
+io-uring = "0.6"
+getrandom = "0.2"

@@ -1,0 +1,9 @@
+.git
+.github
+target
+target-*
+tmp
+dist
+vendor
+**/*.log
+**/*.tmp

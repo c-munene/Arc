@@ -1,0 +1,46 @@
+[package]
+name = "arc-gateway"
+version.workspace = true
+edition = "2021"
+license = "Apache-2.0"
+publish = false
+
+[features]
+default = []
+http2 = []
+h2-native-upstream = []
+
+[dependencies]
+libc = "0.2"
+bytes = "1"
+http = "1"
+http-body-util = "0.1"
+hyper = { version = "1", features = ["client", "server", "http1", "http2"] }
+hyper-util = { version = "0.1", features = ["client", "client-legacy", "server", "http1", "http2", "tokio"] }
+rustls = { version = "0.23", default-features = false, features = ["std", "ring", "tls12"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "sync", "time"] }
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+toml = "0.8"
+serde_yaml = "0.9"
+
+arc-common = { path = "../arc-common" }
+arc-net = { path = "../arc-net" }
+arc-proto-h2 = { path = "../arc-proto-h2" }
+arc-proto-http1 = { path = "../arc-proto-http1" }
+arc-router = { path = "../arc-router" }
+arc-rate-limit = { path = "../arc-rate-limit" }
+arc-global-rate-limit = { path = "../arc-global-rate-limit", features = ["redis"] }
+arc-plugins = { path = "../arc-plugins" }
+arc-config = { path = "../arc-config" }
+arc-observability = { path = "../arc-observability" }
+arc-acme = { path = "../arc-acme" }
+arc-logging = { path = "../arc-logging" }
+arc-compression = { path = "../arc-compression" }
+arc-xdp-userspace = { path = "../arc-xdp-userspace" }
+arc-xdp-common = { path = "../arc-xdp-common" }
+
+arc-swap = "1"
+signal-hook = "0.3"
+uuid = { version = "1", features = ["v4", "v7"] }

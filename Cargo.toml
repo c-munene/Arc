@@ -1,0 +1,35 @@
+[workspace]
+resolver = "2"
+members = [
+  "crates/arc-cli",
+  "crates/arc-common",
+  "crates/arc-logging",
+  "crates/arc-net",
+  "crates/arc-proto-h2",
+  "crates/arc-proto-http1",
+  "crates/arc-router",
+  "crates/arc-rate-limit",
+  "crates/arc-global-rate-limit",
+  "crates/arc-plugins",
+  "crates/arc-config",
+  "crates/arc-observability",
+  "crates/arc-compression",
+  "crates/arc-gateway",
+  "crates/arc-acme",
+  "crates/arc-xdp-userspace",
+  "crates/arc-xdp",
+  "crates/arc-xdp-common",
+]
+
+[workspace.package]
+version = "0.1.0"
+
+[profile.release]
+lto = "fat"
+codegen-units = 1
+panic = "abort"
+opt-level = 3
+debug = 1
+
+[patch.crates-io]
+rustls-acme = { path = "vendor/rustls-acme" }

@@ -1,0 +1,82 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: arc-gateway
+  namespace: arc-gateway
+spec:
+  replicas: 2
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge: 1
+      maxUnavailable: 0
+  selector:
+    matchLabels:
+      app: arc-gateway
+  template:
+    metadata:
+      labels:
+        app: arc-gateway
+    spec:
+      terminationGracePeriodSeconds: 35
+      containers:
+        - name: arc-gateway
+          image: arc-gateway:0.1.0
+          imagePullPolicy: IfNotPresent
+          args: ["--config", "/etc/arc/arc.toml"]
+          ports:
+            - name: http
+              containerPort: 8080
+            - name: https
+              containerPort: 8443
+            - name: admin
+              containerPort: 9090
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: 9090
+              httpHeaders:
+                - name: Authorization
+                  value: "Bearer $(ARC_TOKEN)"
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          readinessProbe:
+            httpGet:
+              path: /healthz
+              port: 9090
+              httpHeaders:
+                - name: Authorization
+                  value: "Bearer $(ARC_TOKEN)"
+            initialDelaySeconds: 3
+            periodSeconds: 5
+          lifecycle:
+            preStop:
+              exec:
+                command: ["/bin/sh", "-c", "sleep 5"]
+          resources:
+            requests:
+              cpu: "500m"
+              memory: "256Mi"
+            limits:
+              cpu: "2000m"
+              memory: "1Gi"
+          env:
+            - name: ARC_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: arc-gateway-secret
+                  key: auth-token
+          volumeMounts:
+            - name: config
+              mountPath: /etc/arc
+      volumes:
+        - name: config
+          configMap:
+            name: arc-gateway-config
+
+      # 如果需要 XDP DDoS 防护，取消注释以下配置
+      # securityContext:
+      #   capabilities:
+      #     add: ["NET_ADMIN", "SYS_ADMIN"]
+      #   privileged: true
+      # 注意：需要节点内核支持 eBPF，且托管 K8s 平台通常不可用

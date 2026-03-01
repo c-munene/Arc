@@ -1,0 +1,15 @@
+[package]
+name = "arc-proto-http1"
+version.workspace = true
+edition = "2021"
+license = "Apache-2.0"
+publish = false
+
+[features]
+default = []
+# 说明：
+# - 纯协议解析：零堆分配，面向 bytes slice。
+# - 不引入网络/路由/插件。
+
+[dependencies]
+arc-common = { path = "../arc-common" }

@@ -1,0 +1,22 @@
+{
+  "tool": "wrk|h2load",
+  "cases": {
+    "arc": {
+      "run_count": 5,
+      "runs": [
+        {
+          "file": "path/to/raw_output.txt"
+        }
+      ]
+    },
+    "nginx": {
+      "run_count": 5,
+      "runs": []
+    }
+  },
+  "compare": {
+    "arc_vs_nginx_rps_ratio_median": 0.0,
+    "arc_vs_nginx_rps_gap_pct_median": 0.0
+  }
+}
+

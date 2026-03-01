@@ -1,0 +1,32 @@
+[package]
+name = "arc-daemon"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "arc-daemon"
+path = "src/main.rs"
+
+[dependencies]
+arc-core = { path = "../arc-core" }
+anyhow.workspace = true
+serde_json.workspace = true
+serde_yaml.workspace = true
+clap.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+prometheus.workspace = true
+axum.workspace = true
+uuid.workspace = true
+
+tokio.workspace = true
+
+# Pingora engine
+pingora = { version = "0.7", features = ["proxy", "lb", "openssl", "connection_filter"] }
+
+[target.'cfg(not(target_os = "windows"))'.dependencies]
+jemallocator = "0.5"
+
+[target.'cfg(target_os = "windows")'.dependencies]
+mimalloc = "0.1"
