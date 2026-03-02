@@ -12,9 +12,9 @@ ARCH=$(uname -m)
 case "${OS}_${ARCH}" in
   linux_x86_64)  ASSET="${BIN}-linux-x86_64" ;;
   linux_aarch64) ASSET="${BIN}-linux-arm64" ;;
-  darwin_arm64)  ASSET="${BIN}-macos-arm64" ;;
   *)
     echo "Unsupported platform: ${OS}_${ARCH}"
+    echo "Current release assets: linux-x86_64, linux-arm64"
     exit 1
     ;;
 esac

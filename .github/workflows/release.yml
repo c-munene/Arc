@@ -19,9 +19,6 @@ jobs:
           - target: aarch64-unknown-linux-gnu
             os: ubuntu-latest
             name: arc-gateway-linux-arm64
-          - target: aarch64-apple-darwin
-            os: macos-latest
-            name: arc-gateway-macos-arm64
 
     runs-on: ${{ matrix.os }}
     steps:
@@ -72,6 +69,5 @@ jobs:
           files: |
             arc-gateway-linux-x86_64
             arc-gateway-linux-arm64
-            arc-gateway-macos-arm64
             SHA256SUMS
           generate_release_notes: true
