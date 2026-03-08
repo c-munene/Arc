@@ -56,9 +56,9 @@ use crate::timeout_tier::{dur_to_ns_saturating, RequestTimeoutState};
 use crate::tls::{build_upstream_client_config, UpstreamTlsRuntime};
 use arc_swap::ArcSwap;
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::io::{self, Read, Write};
-use std::net::{IpAddr, SocketAddr, TcpStream, ToSocketAddrs};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, TcpStream, ToSocketAddrs};
 use std::os::fd::RawFd;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, OnceLock};
@@ -193,6 +193,15 @@ impl HttpBodyState {
             }
             BodyKind::Chunked(st) => Self::Chunked(st),
             BodyKind::UntilEof => Self::UntilEof,
+        }
+    }
+
+    #[inline]
+    fn from_response_kind(kind: BodyKind, suppress_body: bool) -> Self {
+        if suppress_body {
+            Self::None
+        } else {
+            Self::from_kind(kind)
         }
     }
 
@@ -856,6 +865,8 @@ pub struct Worker {
     metrics: Arc<WorkerMetrics>,
 
     listener_fi: i32,
+    listener_addr: SocketAddr,
+    local_listener_ips: Arc<[IpAddr]>,
 
     uring: Uring,
     bufs: FixedBuffers,
@@ -1367,6 +1378,14 @@ impl Worker {
         let downstream_tls = DownstreamTls::build(&cfg)?;
         let listener_fd = net::create_listener(&cfg.listen, cfg.listen_backlog, true)
             .map_err(|e| ArcError::io("create_listener", e))?;
+        let listener_addr = socket_local_addr(listener_fd)
+            .or_else(|| cfg.listen.to_socket_addrs().ok().and_then(|mut addrs| addrs.next()))
+            .ok_or_else(|| {
+                ArcError::config(format!("resolve listener address failed: {}", cfg.listen))
+            })?;
+        let local_listener_ips = Arc::<[IpAddr]>::from(
+            collect_local_listener_ips(listener_addr).into_boxed_slice(),
+        );
 
         // io_uring init with fallbacks
         let mut io_cfg = cfg.io_uring.clone();
@@ -1539,6 +1558,8 @@ impl Worker {
             metrics,
 
             listener_fi,
+            listener_addr,
+            local_listener_ips,
 
             uring,
             bufs,
@@ -2159,6 +2180,15 @@ impl Worker {
     #[inline]
     fn upstream_runtime_addr(&self, upstream_id: usize) -> Option<SocketAddr> {
         self.upstream_runtime_addrs.get(upstream_id).copied()
+    }
+
+    #[inline]
+    fn is_self_upstream_addr(&self, upstream_addr: SocketAddr) -> bool {
+        listener_reaches_addr(
+            self.listener_addr,
+            self.local_listener_ips.as_ref(),
+            upstream_addr,
+        )
     }
 
     fn refresh_upstream_dns(&mut self, now_ns: u64) {
@@ -7325,6 +7355,10 @@ impl Worker {
                         return Ok(());
                     }
                 };
+                if self.is_self_upstream_addr(up_addr) {
+                    self.queue_error_response(key, RESP_502)?;
+                    return Ok(());
+                }
 
                 let Some(conn) = self.conns.get_mut(key) else {
                     return Ok(());
@@ -7837,7 +7871,10 @@ impl Worker {
                             return Ok(());
                         }
 
-                        conn.resp_body = HttpBodyState::from_kind(head.body);
+                        conn.resp_body = HttpBodyState::from_response_kind(
+                            head.body,
+                            conn.log_method.eq_ignore_ascii_case("HEAD"),
+                        );
                         conn.resp_compressed = false;
                         conn.resp_compress_alg = Algorithm::Identity;
                         conn.resp_compress_level = 0;
@@ -9651,6 +9688,114 @@ fn socket_peer_addr(fd: RawFd) -> (String, u16) {
 }
 
 #[inline]
+fn socket_local_addr(fd: RawFd) -> Option<SocketAddr> {
+    if fd < 0 {
+        return None;
+    }
+    let mut storage: libc::sockaddr_storage = unsafe { std::mem::zeroed() };
+    let mut len = std::mem::size_of::<libc::sockaddr_storage>() as libc::socklen_t;
+    let rc = unsafe {
+        libc::getsockname(
+            fd,
+            (&mut storage as *mut libc::sockaddr_storage).cast(),
+            &mut len,
+        )
+    };
+    if rc != 0 {
+        return None;
+    }
+
+    match storage.ss_family as i32 {
+        libc::AF_INET => {
+            let sa: libc::sockaddr_in =
+                unsafe { std::ptr::read((&storage as *const libc::sockaddr_storage).cast()) };
+            Some(SocketAddr::from((
+                IpAddr::V4(Ipv4Addr::from(u32::from_be(sa.sin_addr.s_addr))),
+                u16::from_be(sa.sin_port),
+            )))
+        }
+        libc::AF_INET6 => {
+            let sa: libc::sockaddr_in6 =
+                unsafe { std::ptr::read((&storage as *const libc::sockaddr_storage).cast()) };
+            Some(SocketAddr::from((
+                IpAddr::V6(Ipv6Addr::from(sa.sin6_addr.s6_addr)),
+                u16::from_be(sa.sin6_port),
+            )))
+        }
+        _ => None,
+    }
+}
+
+fn collect_local_listener_ips(listener_addr: SocketAddr) -> Vec<IpAddr> {
+    let listener_ip = listener_addr.ip();
+    let mut seen = HashSet::new();
+    let mut out = Vec::new();
+    let mut push_ip = |ip: IpAddr| {
+        if ip.is_ipv4() == listener_ip.is_ipv4() && seen.insert(ip) {
+            out.push(ip);
+        }
+    };
+
+    if !listener_ip.is_unspecified() {
+        push_ip(listener_ip);
+    }
+    match listener_ip {
+        IpAddr::V4(_) => push_ip(IpAddr::V4(Ipv4Addr::LOCALHOST)),
+        IpAddr::V6(_) => push_ip(IpAddr::V6(Ipv6Addr::LOCALHOST)),
+    }
+
+    let mut ifaddrs: *mut libc::ifaddrs = std::ptr::null_mut();
+    if unsafe { libc::getifaddrs(&mut ifaddrs) } != 0 {
+        return out;
+    }
+
+    let mut current = ifaddrs;
+    while !current.is_null() {
+        let ifa = unsafe { &*current };
+        let addr = ifa.ifa_addr;
+        if !addr.is_null() {
+            match unsafe { (*addr).sa_family as i32 } {
+                libc::AF_INET => {
+                    let sa: libc::sockaddr_in = unsafe { std::ptr::read(addr.cast()) };
+                    push_ip(IpAddr::V4(Ipv4Addr::from(u32::from_be(sa.sin_addr.s_addr))));
+                }
+                libc::AF_INET6 => {
+                    let sa: libc::sockaddr_in6 = unsafe { std::ptr::read(addr.cast()) };
+                    push_ip(IpAddr::V6(Ipv6Addr::from(sa.sin6_addr.s6_addr)));
+                }
+                _ => {}
+            }
+        }
+        current = ifa.ifa_next;
+    }
+
+    unsafe {
+        libc::freeifaddrs(ifaddrs);
+    }
+    out
+}
+
+#[inline]
+fn listener_reaches_addr(
+    listener_addr: SocketAddr,
+    local_listener_ips: &[IpAddr],
+    upstream_addr: SocketAddr,
+) -> bool {
+    if listener_addr.port() != upstream_addr.port() {
+        return false;
+    }
+    let listener_ip = listener_addr.ip();
+    if listener_ip.is_unspecified() {
+        return listener_ip.is_ipv4() == upstream_addr.ip().is_ipv4()
+            && local_listener_ips
+                .iter()
+                .copied()
+                .any(|ip| ip == upstream_addr.ip());
+    }
+    listener_ip == upstream_addr.ip()
+}
+
+#[inline]
 fn socket_so_error(fd: RawFd) -> io::Result<i32> {
     if fd < 0 {
         return Err(io::Error::new(
@@ -11282,5 +11427,73 @@ mod tests {
         let req_head = b"GET /api HTTP/1.1\r\nHost: example.com\r\n\r\n";
         let res = select_route_http1_from_cfg(&cfg, b"GET", b"/api", req_head, None, false);
         assert_eq!(res, Err(RouteSelectError::NotFound));
+    }
+
+    #[test]
+    fn listener_reaches_addr_matches_local_loopback_when_listener_is_unspecified() {
+        let listener = "0.0.0.0:80".parse::<SocketAddr>().expect("listener");
+        let local_ips = [
+            "127.0.0.1".parse::<IpAddr>().expect("loopback"),
+            "192.0.2.10".parse::<IpAddr>().expect("host ip"),
+        ];
+
+        assert!(listener_reaches_addr(
+            listener,
+            &local_ips,
+            "127.0.0.1:80".parse::<SocketAddr>().expect("upstream"),
+        ));
+        assert!(listener_reaches_addr(
+            listener,
+            &local_ips,
+            "192.0.2.10:80".parse::<SocketAddr>().expect("upstream"),
+        ));
+        assert!(!listener_reaches_addr(
+            listener,
+            &local_ips,
+            "127.0.0.1:8088".parse::<SocketAddr>().expect("other port"),
+        ));
+    }
+
+    #[test]
+    fn listener_reaches_addr_respects_specific_bind_ip() {
+        let listener = "192.0.2.10:80".parse::<SocketAddr>().expect("listener");
+        let local_ips = [
+            "127.0.0.1".parse::<IpAddr>().expect("loopback"),
+            "192.0.2.10".parse::<IpAddr>().expect("host ip"),
+        ];
+
+        assert!(listener_reaches_addr(
+            listener,
+            &local_ips,
+            "192.0.2.10:80".parse::<SocketAddr>().expect("exact match"),
+        ));
+        assert!(!listener_reaches_addr(
+            listener,
+            &local_ips,
+            "127.0.0.1:80".parse::<SocketAddr>().expect("loopback"),
+        ));
+    }
+
+    #[test]
+    fn head_response_does_not_track_content_length_body() {
+        let resp = b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\n";
+        let hend = find_header_end(resp).expect("header end");
+        let head = parse_response_head(resp, hend).expect("response head");
+
+        let state = HttpBodyState::from_response_kind(head.body, true);
+        assert!(matches!(state, HttpBodyState::None));
+    }
+
+    #[test]
+    fn non_head_response_keeps_content_length_body_tracking() {
+        let resp = b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\n";
+        let hend = find_header_end(resp).expect("header end");
+        let head = parse_response_head(resp, hend).expect("response head");
+
+        let state = HttpBodyState::from_response_kind(head.body, false);
+        assert!(matches!(
+            state,
+            HttpBodyState::ContentLength { remaining: 5 }
+        ));
     }
 }

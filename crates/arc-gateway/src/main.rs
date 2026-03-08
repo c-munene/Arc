@@ -26,7 +26,7 @@ use arc_observability::{start_admin_server, MetricsRegistry};
 use cluster_circuit::{ClusterCircuit, ClusterCircuitConfig};
 
 use std::collections::HashSet;
-use std::net::{Shutdown, SocketAddr, TcpStream};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, Shutdown, SocketAddr, TcpStream};
 use std::path::PathBuf;
 use std::process;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -65,20 +65,25 @@ fn real_main() -> Result<()> {
     let args = Args::from_env()?;
     if args.check_only {
         let report = ConfigManager::check_from_path(&args.config_path)?;
-        if report.errors.is_empty() {
+        let mut errors: Vec<String> = report.errors.iter().map(ToString::to_string).collect();
+        if errors.is_empty() {
+            let cfg = ConfigManager::load_from_path(&args.config_path)?;
+            if let Err(e) = validate_no_self_upstream(&cfg) {
+                errors.push(e.to_string());
+            }
+        }
+        if errors.is_empty() {
             println!("config OK");
             return Ok(());
         }
-        for (idx, err) in report.errors.iter().enumerate() {
+        for (idx, err) in errors.iter().enumerate() {
             eprintln!("error[{}]: {}", idx + 1, err);
         }
-        eprintln!(
-            "Found {} errors, config not valid",
-            report.errors.len()
-        );
+        eprintln!("Found {} errors, config not valid", errors.len());
         process::exit(1);
     }
     let cfg = ConfigManager::load_from_path(&args.config_path)?;
+    validate_no_self_upstream(&cfg)?;
     let admin_auth_token = resolve_management_auth_token(&cfg);
     warn_if_management_surface_public(&cfg);
 
@@ -337,6 +342,85 @@ fn warn_if_management_surface_public(cfg: &SharedConfig) {
     }
 }
 
+fn validate_no_self_upstream(cfg: &SharedConfig) -> Result<()> {
+    let listener_addr = cfg.listen;
+    let local_listener_ips = collect_local_listener_ips(listener_addr);
+    for up in cfg.upstreams.iter() {
+        if listener_reaches_addr(listener_addr, local_listener_ips.as_slice(), up.addr) {
+            return Err(ArcError::config(format!(
+                "upstream '{}' ({}) points back to gateway listen {} and would create a self-proxy loop; move it to a different port or address",
+                up.name, up.addr, listener_addr
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn collect_local_listener_ips(listener_addr: SocketAddr) -> Vec<IpAddr> {
+    let listener_ip = listener_addr.ip();
+    let mut seen = HashSet::new();
+    let mut out = Vec::new();
+    let mut push_ip = |ip: IpAddr| {
+        if ip.is_ipv4() == listener_ip.is_ipv4() && seen.insert(ip) {
+            out.push(ip);
+        }
+    };
+
+    if !listener_ip.is_unspecified() {
+        push_ip(listener_ip);
+    }
+    match listener_ip {
+        IpAddr::V4(_) => push_ip(IpAddr::V4(Ipv4Addr::LOCALHOST)),
+        IpAddr::V6(_) => push_ip(IpAddr::V6(Ipv6Addr::LOCALHOST)),
+    }
+
+    let mut ifaddrs: *mut libc::ifaddrs = std::ptr::null_mut();
+    if unsafe { libc::getifaddrs(&mut ifaddrs) } != 0 {
+        return out;
+    }
+
+    let mut current = ifaddrs;
+    while !current.is_null() {
+        let ifa = unsafe { &*current };
+        let addr = ifa.ifa_addr;
+        if !addr.is_null() {
+            match unsafe { (*addr).sa_family as i32 } {
+                libc::AF_INET => {
+                    let sa: libc::sockaddr_in = unsafe { std::ptr::read(addr.cast()) };
+                    push_ip(IpAddr::V4(Ipv4Addr::from(u32::from_be(sa.sin_addr.s_addr))));
+                }
+                libc::AF_INET6 => {
+                    let sa: libc::sockaddr_in6 = unsafe { std::ptr::read(addr.cast()) };
+                    push_ip(IpAddr::V6(Ipv6Addr::from(sa.sin6_addr.s6_addr)));
+                }
+                _ => {}
+            }
+        }
+        current = ifa.ifa_next;
+    }
+
+    unsafe {
+        libc::freeifaddrs(ifaddrs);
+    }
+    out
+}
+
+fn listener_reaches_addr(
+    listener_addr: SocketAddr,
+    local_listener_ips: &[IpAddr],
+    upstream_addr: SocketAddr,
+) -> bool {
+    if listener_addr.port() != upstream_addr.port() {
+        return false;
+    }
+    let listener_ip = listener_addr.ip();
+    if listener_ip.is_unspecified() {
+        return listener_ip.is_ipv4() == upstream_addr.ip().is_ipv4()
+            && local_listener_ips.iter().copied().any(|ip| ip == upstream_addr.ip());
+    }
+    listener_ip == upstream_addr.ip()
+}
+
 fn spawn_active_upstream_health_checker(
     mgr: ConfigManager,
     cluster_circuit: Arc<ClusterCircuit>,
@@ -431,4 +515,56 @@ OPTIONS:
   -h, --help         Print this help
 "
     );
+}
+
+
+#[cfg(test)]
+mod tests {
+    use super::listener_reaches_addr;
+    use std::net::{IpAddr, SocketAddr};
+
+    #[test]
+    fn listener_reaches_addr_matches_local_loopback_when_listener_is_unspecified() {
+        let listener = "0.0.0.0:80".parse::<SocketAddr>().expect("listener");
+        let local_ips = [
+            "127.0.0.1".parse::<IpAddr>().expect("loopback"),
+            "192.0.2.10".parse::<IpAddr>().expect("host ip"),
+        ];
+
+        assert!(listener_reaches_addr(
+            listener,
+            &local_ips,
+            "127.0.0.1:80".parse::<SocketAddr>().expect("upstream"),
+        ));
+        assert!(listener_reaches_addr(
+            listener,
+            &local_ips,
+            "192.0.2.10:80".parse::<SocketAddr>().expect("upstream"),
+        ));
+        assert!(!listener_reaches_addr(
+            listener,
+            &local_ips,
+            "127.0.0.1:8088".parse::<SocketAddr>().expect("other port"),
+        ));
+    }
+
+    #[test]
+    fn listener_reaches_addr_respects_specific_bind_ip() {
+        let listener = "192.0.2.10:80".parse::<SocketAddr>().expect("listener");
+        let local_ips = [
+            "127.0.0.1".parse::<IpAddr>().expect("loopback"),
+            "192.0.2.10".parse::<IpAddr>().expect("host ip"),
+        ];
+
+        assert!(listener_reaches_addr(
+            listener,
+            &local_ips,
+            "192.0.2.10:80".parse::<SocketAddr>().expect("exact match"),
+        ));
+        assert!(!listener_reaches_addr(
+            listener,
+            &local_ips,
+            "127.0.0.1:80".parse::<SocketAddr>().expect("loopback"),
+        ));
+    }
 }
