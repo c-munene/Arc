@@ -4,7 +4,9 @@ use arc_common::{ArcError, Result};
 use arc_config::SharedConfig;
 use arc_xdp_common::{
     AttackKind, BlacklistEntry, BlockReason, GlobalStats, IpKey, PortStats, SynState, XdpConfig,
-    XdpEvent,
+    XdpEvent, ARC_XDP_ABI_VERSION, CFG_F_ENABLE_ACK_FLOOD, CFG_F_ENABLE_RST_VALIDATE,
+    CFG_F_ENABLE_SYN_FLOOD, CFG_F_ENABLE_SYN_PROXY, CFG_F_GLOBAL_DEFENSE_MODE,
+    XDP_CONFIG_MAGIC,
 };
 use std::fmt;
 use std::os::fd::RawFd;
@@ -811,16 +813,23 @@ impl XdpManager {
 
         // config map key convention assumption: singleton key 0 (u32).
         let key: u32 = 0;
-        let mut cur: XdpConfig = unsafe { std::mem::zeroed() };
+        let mut cur = XdpConfig::conservative_default();
         let found = map_lookup_elem::<u32, XdpConfig>(maps.config, &key, &mut cur)
             .ok()
             .unwrap_or(false);
         if !found {
-            // if no entry, write fresh config
             cur = make_default_xdp_config(xcfg);
         } else {
-            // update toggles
             apply_xdp_config_toggles(&mut cur, xcfg);
+        }
+        if xcfg.enabled {
+            let dyn_thr = self.state.dynamic_syn_threshold_pps.load(Ordering::Relaxed);
+            if dyn_thr > 0 {
+                apply_dynamic_threshold(&mut cur, dyn_thr);
+            }
+            if self.state.defense_mode_active.load(Ordering::Relaxed) {
+                apply_defense_multiplier(&mut cur, xcfg.defense.defense_multiplier);
+            }
         }
 
         if let Err(e) = map_update_elem::<u32, XdpConfig>(maps.config, &key, &cur, 0) {
@@ -967,14 +976,17 @@ impl XdpManager {
         };
 
         let key: u32 = 0;
-        let mut cur: XdpConfig = unsafe { std::mem::zeroed() };
+        let mut cur = XdpConfig::conservative_default();
         let found = map_lookup_elem::<u32, XdpConfig>(maps.config, &key, &mut cur)
             .ok()
             .unwrap_or(false);
         if !found {
             cur = make_default_xdp_config(&cfg.xdp);
         }
-        // Apply defense multiplier
+        let dyn_thr = self.state.dynamic_syn_threshold_pps.load(Ordering::Relaxed);
+        if dyn_thr > 0 {
+            apply_dynamic_threshold(&mut cur, dyn_thr);
+        }
         apply_defense_multiplier(&mut cur, cfg.xdp.defense.defense_multiplier);
 
         let _ = map_update_elem::<u32, XdpConfig>(maps.config, &key, &cur, 0);
@@ -1180,16 +1192,19 @@ impl XdpManager {
         };
 
         let key: u32 = 0;
-        let mut cur: XdpConfig = unsafe { std::mem::zeroed() };
+        let mut cur = XdpConfig::conservative_default();
         let found = map_lookup_elem::<u32, XdpConfig>(maps.config, &key, &mut cur)
             .ok()
             .unwrap_or(false);
+        let cfg = self.cfg.read().await.clone();
         if !found {
-            let cfg = self.cfg.read().await.clone();
             cur = make_default_xdp_config(&cfg.xdp);
         }
 
         apply_dynamic_threshold(&mut cur, thr_pps);
+        if self.state.defense_mode_active.load(Ordering::Relaxed) && cfg.xdp.enabled {
+            apply_defense_multiplier(&mut cur, cfg.xdp.defense.defense_multiplier);
+        }
 
         if let Err(e) = map_update_elem::<u32, XdpConfig>(maps.config, &key, &cur, 0) {
             eprintln!("xdp warn: write dynamic threshold failed: {e}");
@@ -1670,30 +1685,97 @@ fn make_blacklist_entry(ttl: Duration, reason: BlockReason) -> BlacklistEntry {
 }
 
 /// Make default XdpConfig from user config.
-///
-/// ASSUMPTION: XdpConfig can be safely zeroed and then toggles applied.
 fn make_default_xdp_config(xcfg: &XdpUserConfig) -> XdpConfig {
-    let mut c: XdpConfig = unsafe { std::mem::zeroed() };
+    let mut c = XdpConfig::conservative_default();
     apply_xdp_config_toggles(&mut c, xcfg);
     c
 }
 
+const XDP_DEFAULT_CONNTRACK_TTL_SECS: u64 = 60;
+const XDP_DEFAULT_SYN_STATE_TTL_SECS: u64 = 60;
+const XDP_DEFAULT_BLACKLIST_AFTER_DROPS: u16 = 3;
+
+#[inline]
+fn secs_to_ns_saturating(secs: u64) -> u64 {
+    Duration::from_secs(secs)
+        .as_nanos()
+        .min(u128::from(u64::MAX)) as u64
+}
+
+#[inline]
+fn xdp_base_flags(xcfg: &XdpUserConfig) -> u32 {
+    if !xcfg.enabled {
+        return 0;
+    }
+
+    let mut flags = CFG_F_ENABLE_SYN_FLOOD | CFG_F_ENABLE_RST_VALIDATE | CFG_F_ENABLE_ACK_FLOOD;
+    if xcfg.syn_proxy.enabled {
+        flags |= CFG_F_ENABLE_SYN_PROXY;
+    }
+    flags
+}
+
+#[inline]
+fn tighten_u32(value: u32, multiplier: f64) -> u32 {
+    if value == 0 || value == u32::MAX || !multiplier.is_finite() || multiplier <= 1.0 {
+        return value;
+    }
+
+    ((value as f64 / multiplier).floor())
+        .clamp(1.0, u32::MAX as f64) as u32
+}
+
+#[inline]
+fn tighten_u16(value: u16, multiplier: f64) -> u16 {
+    if value == 0 || !multiplier.is_finite() || multiplier <= 1.0 {
+        return value;
+    }
+
+    ((value as f64 / multiplier).floor())
+        .clamp(1.0, u16::MAX as f64) as u16
+}
+
 /// Apply syn_proxy/defense toggles to XdpConfig.
-///
-/// ASSUMPTION: XdpConfig has fields to represent these toggles.
-fn apply_xdp_config_toggles(_c: &mut XdpConfig, _xcfg: &XdpUserConfig) {
-    // NOTE: Without concrete struct fields from arc-xdp-common, we cannot set them precisely here.
-    // This is intentionally a no-op placeholder-free implementation: it performs no invalid field access.
+fn apply_xdp_config_toggles(c: &mut XdpConfig, xcfg: &XdpUserConfig) {
+    let preserved = if c.is_valid() {
+        *c
+    } else {
+        XdpConfig::conservative_default()
+    };
+
+    *c = XdpConfig::conservative_default();
+    c.magic = XDP_CONFIG_MAGIC;
+    c.version = ARC_XDP_ABI_VERSION;
+    c.flags = xdp_base_flags(xcfg);
+    c.syn_threshold = preserved.syn_threshold;
+    c.active_conns_estimate = preserved.active_conns_estimate;
+    c.udp_tracked_ports = preserved.udp_tracked_ports;
+    c.udp_rate_limit_pps = preserved.udp_rate_limit_pps;
+    c.udp_rate_limit_bps = preserved.udp_rate_limit_bps;
+    c.syn_cookie_secret = preserved.syn_cookie_secret;
+    c.syn_cookie_key_id = preserved.syn_cookie_key_id;
+
+    if xcfg.enabled {
+        c.syn_blacklist_after_drops = XDP_DEFAULT_BLACKLIST_AFTER_DROPS;
+        c.ack_blacklist_after_drops = XDP_DEFAULT_BLACKLIST_AFTER_DROPS;
+        c.blacklist_ttl_ns = secs_to_ns_saturating(xcfg.auto_block.ttl_secs);
+        c.conntrack_ttl_ns = secs_to_ns_saturating(XDP_DEFAULT_CONNTRACK_TTL_SECS);
+        c.syn_state_ttl_ns = secs_to_ns_saturating(XDP_DEFAULT_SYN_STATE_TTL_SECS);
+    }
 }
 
 /// Apply defense multiplier in XdpConfig.
-fn apply_defense_multiplier(_c: &mut XdpConfig, _multiplier: f64) {
-    // same reason as above
+fn apply_defense_multiplier(c: &mut XdpConfig, multiplier: f64) {
+    c.flags |= CFG_F_GLOBAL_DEFENSE_MODE;
+    c.syn_threshold = tighten_u32(c.syn_threshold, multiplier);
+    c.ack_limit_per_conn = tighten_u32(c.ack_limit_per_conn, multiplier);
+    c.syn_blacklist_after_drops = tighten_u16(c.syn_blacklist_after_drops, multiplier);
+    c.ack_blacklist_after_drops = tighten_u16(c.ack_blacklist_after_drops, multiplier);
 }
 
 /// Apply dynamic threshold in XdpConfig.
-fn apply_dynamic_threshold(_c: &mut XdpConfig, _thr_pps: u64) {
-    // same reason as above
+fn apply_dynamic_threshold(c: &mut XdpConfig, thr_pps: u64) {
+    c.syn_threshold = thr_pps.max(1).min(u64::from(u32::MAX)) as u32;
 }
 
 fn extract_current_syn_bucket(_gs: &GlobalStats) -> u64 {
@@ -1954,6 +2036,56 @@ exit 1
         let got = resolve_loader_bin("arc-xdp-loader", "ARC_XDP_LOADER");
         assert_eq!(got, "/tmp/custom-xdp-loader".to_string());
         std::env::remove_var("ARC_XDP_LOADER");
+    }
+
+    #[test]
+    fn make_default_xdp_config_populates_kernel_runtime_fields() {
+        let mut cfg = XdpUserConfig::default();
+        cfg.enabled = true;
+        cfg.syn_proxy.enabled = true;
+        cfg.auto_block.ttl_secs = 42;
+
+        let got = make_default_xdp_config(&cfg);
+        assert_eq!(got.magic, arc_xdp_common::XDP_CONFIG_MAGIC);
+        assert_eq!(got.version, arc_xdp_common::ARC_XDP_ABI_VERSION);
+        assert_ne!(got.flags & arc_xdp_common::CFG_F_ENABLE_SYN_FLOOD, 0);
+        assert_ne!(got.flags & arc_xdp_common::CFG_F_ENABLE_RST_VALIDATE, 0);
+        assert_ne!(got.flags & arc_xdp_common::CFG_F_ENABLE_ACK_FLOOD, 0);
+        assert_ne!(got.flags & arc_xdp_common::CFG_F_ENABLE_SYN_PROXY, 0);
+        assert_eq!(got.blacklist_ttl_ns, Duration::from_secs(42).as_nanos() as u64);
+        assert_eq!(got.syn_blacklist_after_drops, XDP_DEFAULT_BLACKLIST_AFTER_DROPS);
+        assert_eq!(got.ack_blacklist_after_drops, XDP_DEFAULT_BLACKLIST_AFTER_DROPS);
+    }
+
+    #[test]
+    fn defense_multiplier_tightens_thresholds_and_sets_flag() {
+        let mut cfg = XdpUserConfig::default();
+        cfg.enabled = true;
+
+        let mut cur = make_default_xdp_config(&cfg);
+        cur.syn_threshold = 200;
+        cur.ack_limit_per_conn = 20;
+        cur.syn_blacklist_after_drops = 6;
+        cur.ack_blacklist_after_drops = 4;
+
+        apply_defense_multiplier(&mut cur, 2.0);
+
+        assert_ne!(cur.flags & arc_xdp_common::CFG_F_GLOBAL_DEFENSE_MODE, 0);
+        assert_eq!(cur.syn_threshold, 100);
+        assert_eq!(cur.ack_limit_per_conn, 10);
+        assert_eq!(cur.syn_blacklist_after_drops, 3);
+        assert_eq!(cur.ack_blacklist_after_drops, 2);
+    }
+
+    #[test]
+    fn dynamic_threshold_is_clamped_to_valid_kernel_range() {
+        let mut cur = XdpConfig::conservative_default();
+
+        apply_dynamic_threshold(&mut cur, 0);
+        assert_eq!(cur.syn_threshold, 1);
+
+        apply_dynamic_threshold(&mut cur, u64::MAX);
+        assert_eq!(cur.syn_threshold, u32::MAX);
     }
 
     #[test]

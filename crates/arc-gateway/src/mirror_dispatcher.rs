@@ -1,7 +1,5 @@
 use std::collections::{HashMap, VecDeque};
-use std::io::{Read, Write};
-use std::net::{SocketAddr, TcpStream};
-use std::panic::{self, AssertUnwindSafe};
+use std::net::SocketAddr;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread;
@@ -9,6 +7,10 @@ use std::time::{Duration, Instant};
 
 use arc_observability::WorkerMetrics;
 use serde_json::Value;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::net::TcpStream;
+use tokio::runtime::{Builder as TokioRuntimeBuilder, Handle, Runtime};
+use tokio::time::{self, Instant as TokioInstant};
 
 /// Drop reason labels required by metrics.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -253,6 +255,7 @@ struct MirrorTask {
 /// Producer path is non-blocking (try-lock + atomic reservation).
 pub struct MirrorDispatcher {
     state: Arc<MirrorDispatcherState>,
+    runtime: Option<Runtime>,
     workers: Vec<thread::JoinHandle<()>>,
 }
 
@@ -276,7 +279,7 @@ struct MirrorDispatcherState {
 impl MirrorDispatcher {
     /// Create a dispatcher and spawn worker threads.
     ///
-    /// `worker_threads` should be small (e.g. 1-2 per gateway worker) since mirror is off-path.
+    /// `worker_threads` is used as the async runtime concurrency for mirror I/O.
     pub fn new(
         policy: MirrorPolicyRuntime,
         worker_threads: usize,
@@ -293,26 +296,34 @@ impl MirrorDispatcher {
         });
 
         let n = worker_threads.max(1);
+        let runtime = TokioRuntimeBuilder::new_multi_thread()
+            .worker_threads(n)
+            .enable_all()
+            .thread_name("arc-mirror-io")
+            .build()
+            .unwrap_or_else(|e| panic!("arc-mirror async runtime init failed: {e}"));
+        let handle = runtime.handle().clone();
+
         let mut workers = Vec::with_capacity(n);
         for i in 0..n {
             let st = Arc::clone(&state);
+            let handle2 = handle.clone();
             let th = thread::Builder::new()
-                .name(format!("arc-mirror-{i}"))
-                .spawn({
-                    let st2 = Arc::clone(&st);
-                    move || mirror_worker_loop(st2)
-                })
+                .name(format!("arc-mirror-dispatch-{i}"))
+                .spawn(move || mirror_worker_loop(st, handle2))
                 .unwrap_or_else(|_| {
-                    // If spawning fails, we cannot safely continue with this worker thread.
-                    // As a pragmatic fallback, run synchronously in the current thread.
-                    // This still preserves the "no propagation to main path" guarantee
-                    // because submit() will continue dropping tasks when try_lock fails.
-                    thread::spawn(move || mirror_worker_loop(st))
+                    let st = Arc::clone(&state);
+                    let handle = handle.clone();
+                    thread::spawn(move || mirror_worker_loop(st, handle))
                 });
             workers.push(th);
         }
 
-        Self { state, workers }
+        Self {
+            state,
+            runtime: Some(runtime),
+            workers,
+        }
     }
 
     pub fn submit_all(
@@ -400,6 +411,9 @@ impl Drop for MirrorDispatcher {
         for h in self.workers.drain(..) {
             let _ = h.join();
         }
+        if let Some(runtime) = self.runtime.take() {
+            runtime.shutdown_timeout(Duration::from_secs(5));
+        }
     }
 }
 
@@ -432,7 +446,7 @@ fn release_queue_bytes(state: &MirrorDispatcherState, bytes: usize) {
     state.queue_bytes.fetch_sub(bytes, Ordering::Relaxed);
 }
 
-fn mirror_worker_loop(state: Arc<MirrorDispatcherState>) {
+fn mirror_worker_loop(state: Arc<MirrorDispatcherState>, handle: Handle) {
     loop {
         let task = {
             let mut q = match state.queue.lock() {
@@ -459,83 +473,83 @@ fn mirror_worker_loop(state: Arc<MirrorDispatcherState>) {
             continue;
         };
 
-        release_queue_bytes(&state, task.reserved_bytes);
-        task.target.metrics.queue_bytes_sub(task.reserved_bytes);
+        let state2 = Arc::clone(&state);
+        let task = Arc::new(task);
+        handle.spawn(async move {
+            let run_task = Arc::clone(&task);
+            let res = tokio::spawn(async move { run_one_task(run_task.as_ref()).await }).await;
+            match res {
+                Ok(outcome) => finish_mirror_task(&state2, task.as_ref(), outcome),
+                Err(_) => finish_mirror_task(
+                    &state2,
+                    task.as_ref(),
+                    Err(MirrorDropReason::UpstreamError),
+                ),
+            }
+        });
+    }
+}
 
-        // MUST catch panics inside mirror tasks (spec guarantee).
-        let res = panic::catch_unwind(AssertUnwindSafe(|| run_one_task(&task)));
+fn finish_mirror_task(
+    state: &MirrorDispatcherState,
+    task: &MirrorTask,
+    res: Result<MirrorOutcome, MirrorDropReason>,
+) {
+    release_queue_bytes(state, task.reserved_bytes);
+    task.target.metrics.queue_bytes_sub(task.reserved_bytes);
 
-        match res {
-            Ok(Ok(outcome)) => {
-                if let Some(wm) = state.worker_metrics.as_ref() {
-                    wm.mirror_sent_total.fetch_add(1, Ordering::Relaxed);
-                    let ns = outcome.latency.as_nanos();
-                    let ns_u64 = if ns > u64::MAX as u128 {
-                        u64::MAX
-                    } else {
-                        ns as u64
-                    };
-                    wm.mirror_latency_count.fetch_add(1, Ordering::Relaxed);
-                    wm.mirror_latency_sum_ns
-                        .fetch_add(ns_u64, Ordering::Relaxed);
-                    if (200..=299).contains(&outcome.status) {
-                        wm.mirror_status_2xx_total.fetch_add(1, Ordering::Relaxed);
-                    } else if (300..=399).contains(&outcome.status) {
-                        wm.mirror_status_3xx_total.fetch_add(1, Ordering::Relaxed);
-                    } else if (400..=499).contains(&outcome.status) {
-                        wm.mirror_status_4xx_total.fetch_add(1, Ordering::Relaxed);
-                    } else if (500..=599).contains(&outcome.status) {
-                        wm.mirror_status_5xx_total.fetch_add(1, Ordering::Relaxed);
-                    } else {
-                        wm.mirror_status_other_total.fetch_add(1, Ordering::Relaxed);
-                    }
+    match res {
+        Ok(outcome) => {
+            if let Some(wm) = state.worker_metrics.as_ref() {
+                wm.mirror_sent_total.fetch_add(1, Ordering::Relaxed);
+                let ns = outcome.latency.as_nanos();
+                let ns_u64 = if ns > u64::MAX as u128 {
+                    u64::MAX
+                } else {
+                    ns as u64
+                };
+                wm.mirror_latency_count.fetch_add(1, Ordering::Relaxed);
+                wm.mirror_latency_sum_ns
+                    .fetch_add(ns_u64, Ordering::Relaxed);
+                if (200..=299).contains(&outcome.status) {
+                    wm.mirror_status_2xx_total.fetch_add(1, Ordering::Relaxed);
+                } else if (300..=399).contains(&outcome.status) {
+                    wm.mirror_status_3xx_total.fetch_add(1, Ordering::Relaxed);
+                } else if (400..=499).contains(&outcome.status) {
+                    wm.mirror_status_4xx_total.fetch_add(1, Ordering::Relaxed);
+                } else if (500..=599).contains(&outcome.status) {
+                    wm.mirror_status_5xx_total.fetch_add(1, Ordering::Relaxed);
+                } else {
+                    wm.mirror_status_other_total.fetch_add(1, Ordering::Relaxed);
                 }
             }
-            Ok(Err(e)) => {
-                let reason = e;
-                let c = task.target.metrics.inc_dropped(reason);
-                if reason == MirrorDropReason::Timeout && (c & 1023) == 1 {
-                    eprintln!(
-                        "WARN arc-mirror timeout upstream={} dropped_timeout_total={}",
-                        task.target.upstream, c
-                    );
-                }
-                if reason == MirrorDropReason::UpstreamError && (c & 1023) == 1 {
-                    eprintln!(
-                        "WARN arc-mirror upstream_error upstream={} dropped_upstream_error_total={}",
-                        task.target.upstream, c
-                    );
-                }
-                if let Some(wm) = state.worker_metrics.as_ref() {
-                    match reason {
-                        MirrorDropReason::QueueFull => {
-                            wm.mirror_queue_full_total.fetch_add(1, Ordering::Relaxed);
-                        }
-                        MirrorDropReason::UpstreamError => {
-                            wm.mirror_upstream_error_total
-                                .fetch_add(1, Ordering::Relaxed);
-                        }
-                        MirrorDropReason::Timeout => {
-                            wm.mirror_timeout_total.fetch_add(1, Ordering::Relaxed);
-                        }
-                    }
-                }
+        }
+        Err(reason) => {
+            let c = task.target.metrics.inc_dropped(reason);
+            if reason == MirrorDropReason::Timeout && (c & 1023) == 1 {
+                eprintln!(
+                    "WARN arc-mirror timeout upstream={} dropped_timeout_total={}",
+                    task.target.upstream, c
+                );
             }
-            Err(_) => {
-                // Panic -> treat as upstream_error (discard).
-                let c = task
-                    .target
-                    .metrics
-                    .inc_dropped(MirrorDropReason::UpstreamError);
-                if (c & 1023) == 1 {
-                    eprintln!(
-                        "WARN arc-mirror panic_caught upstream={} dropped_upstream_error_total={}",
-                        task.target.upstream, c
-                    );
-                }
-                if let Some(wm) = state.worker_metrics.as_ref() {
-                    wm.mirror_upstream_error_total
-                        .fetch_add(1, Ordering::Relaxed);
+            if reason == MirrorDropReason::UpstreamError && (c & 1023) == 1 {
+                eprintln!(
+                    "WARN arc-mirror upstream_error upstream={} dropped_upstream_error_total={}",
+                    task.target.upstream, c
+                );
+            }
+            if let Some(wm) = state.worker_metrics.as_ref() {
+                match reason {
+                    MirrorDropReason::QueueFull => {
+                        wm.mirror_queue_full_total.fetch_add(1, Ordering::Relaxed);
+                    }
+                    MirrorDropReason::UpstreamError => {
+                        wm.mirror_upstream_error_total
+                            .fetch_add(1, Ordering::Relaxed);
+                    }
+                    MirrorDropReason::Timeout => {
+                        wm.mirror_timeout_total.fetch_add(1, Ordering::Relaxed);
+                    }
                 }
             }
         }
@@ -549,7 +563,7 @@ struct MirrorOutcome {
 }
 
 /// Returns Ok(outcome) if sent successfully (even if diff found), Err(drop_reason) otherwise.
-fn run_one_task(task: &MirrorTask) -> Result<MirrorOutcome, MirrorDropReason> {
+async fn run_one_task(task: &MirrorTask) -> Result<MirrorOutcome, MirrorDropReason> {
     let sent_total = task.target.metrics.inc_sent();
 
     let started = Instant::now();
@@ -560,7 +574,7 @@ fn run_one_task(task: &MirrorTask) -> Result<MirrorOutcome, MirrorDropReason> {
             Err(_) => return Err(MirrorDropReason::UpstreamError),
         };
 
-    let shadow_resp = match http_roundtrip(task.target.addr, &transformed, task.target.timeout) {
+    let shadow_resp = match http_roundtrip(task.target.addr, &transformed, task.target.timeout).await {
         Ok(v) => v,
         Err(HttpRoundtripError::Timeout) => return Err(MirrorDropReason::Timeout),
         Err(HttpRoundtripError::UpstreamError) => return Err(MirrorDropReason::UpstreamError),
@@ -616,7 +630,7 @@ enum HttpRoundtripError {
     UpstreamError,
 }
 
-fn http_roundtrip(
+async fn http_roundtrip(
     addr: SocketAddr,
     req: &[u8],
     timeout: Duration,
@@ -625,21 +639,21 @@ fn http_roundtrip(
         return Err(HttpRoundtripError::Timeout);
     }
 
-    let deadline = Instant::now() + timeout;
+    let deadline = TokioInstant::now() + timeout;
 
-    let remaining = remaining_until(deadline)?;
-    let mut stream = TcpStream::connect_timeout(&addr, remaining).map_err(map_io_err)?;
+    let mut stream = time::timeout_at(deadline, TcpStream::connect(addr))
+        .await
+        .map_err(|_| HttpRoundtripError::Timeout)?
+        .map_err(map_io_err)?;
     let _ = stream.set_nodelay(true);
 
-    let remaining = remaining_until(deadline)?;
-    let _ = stream.set_write_timeout(Some(remaining));
-    stream.write_all(req).map_err(map_io_err)?;
-
-    let remaining = remaining_until(deadline)?;
-    let _ = stream.set_read_timeout(Some(remaining));
+    time::timeout_at(deadline, stream.write_all(req))
+        .await
+        .map_err(|_| HttpRoundtripError::Timeout)?
+        .map_err(map_io_err)?;
 
     let started = Instant::now();
-    let raw = read_http_response(&mut stream, deadline, 16 * 1024 * 1024)?;
+    let raw = read_http_response(&mut stream, deadline, 16 * 1024 * 1024).await?;
     let latency = started.elapsed();
 
     let parsed = parse_http_response(&raw).map_err(|_| HttpRoundtripError::UpstreamError)?;
@@ -651,14 +665,6 @@ fn http_roundtrip(
     })
 }
 
-fn remaining_until(deadline: Instant) -> Result<Duration, HttpRoundtripError> {
-    let now = Instant::now();
-    if now >= deadline {
-        return Err(HttpRoundtripError::Timeout);
-    }
-    Ok(deadline - now)
-}
-
 fn map_io_err(e: std::io::Error) -> HttpRoundtripError {
     match e.kind() {
         std::io::ErrorKind::TimedOut | std::io::ErrorKind::WouldBlock => {
@@ -668,9 +674,9 @@ fn map_io_err(e: std::io::Error) -> HttpRoundtripError {
     }
 }
 
-fn read_http_response(
+async fn read_http_response(
     stream: &mut TcpStream,
-    deadline: Instant,
+    deadline: TokioInstant,
     max_bytes: usize,
 ) -> Result<Vec<u8>, HttpRoundtripError> {
     let mut buf = Vec::with_capacity(8192);
@@ -712,10 +718,10 @@ fn read_http_response(
             return Err(HttpRoundtripError::UpstreamError);
         }
 
-        let remaining = remaining_until(deadline)?;
-        let _ = stream.set_read_timeout(Some(remaining));
-
-        let n = stream.read(&mut tmp).map_err(map_io_err)?;
+        let n = time::timeout_at(deadline, stream.read(&mut tmp))
+            .await
+            .map_err(|_| HttpRoundtripError::Timeout)?
+            .map_err(map_io_err)?;
         if n == 0 {
             // EOF
             return Ok(buf);

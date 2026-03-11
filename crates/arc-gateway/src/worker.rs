@@ -58,7 +58,7 @@ use arc_swap::ArcSwap;
 
 use std::collections::{HashMap, HashSet};
 use std::io::{self, Read, Write};
-use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, TcpStream, ToSocketAddrs};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, ToSocketAddrs};
 use std::os::fd::RawFd;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, OnceLock};
@@ -67,6 +67,7 @@ use uuid::Uuid;
 
 // tail stash for pipelining (fixed, no heap). This is a pragmatic compromise.
 const STASH_CAP: usize = 4096;
+const RESP_STASH_CAP: usize = STASH_CAP;
 const REQ_ACCEPT_ENCODING_CAP: usize = 256;
 const UP_MTLS_PLAIN_DRAIN_BUDGET: usize = 64 * 1024;
 const UP_MTLS_MAX_RESP: usize = 16 * 1024 * 1024;
@@ -276,6 +277,8 @@ struct Conn {
     stash: [u8; STASH_CAP],
     stash_len: u32,
     replay_len: u32,
+    resp_stash: [u8; RESP_STASH_CAP],
+    resp_stash_len: u32,
 
     // request/response semantics
     req_keepalive: bool,
@@ -377,6 +380,8 @@ impl Conn {
             stash: [0u8; STASH_CAP],
             stash_len: 0,
             replay_len: 0,
+            resp_stash: [0u8; RESP_STASH_CAP],
+            resp_stash_len: 0,
             req_keepalive: false,
             resp_keepalive: false,
             req_body: HttpBodyState::None,
@@ -653,7 +658,12 @@ impl H2DownstreamSink for H2RequestCollector {
 
     fn on_goaway(&mut self, _down: H2ConnKey, _last_sid: u32, _code: arc_proto_h2::error::H2Code) {}
 
-    fn on_conn_error(&mut self, _down: H2ConnKey, _err: arc_proto_h2::error::H2Error) {}
+    fn on_conn_error(&mut self, _down: H2ConnKey, _err: arc_proto_h2::error::H2Error) {
+        self.ready.clear();
+        for (_, mut pending) in self.pending.drain() {
+            self.dropped.append(&mut pending.body);
+        }
+    }
 }
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
@@ -724,6 +734,7 @@ struct H2H1Task {
     upstream_fd: RawFd,
     upstream_fi: i32,
     upstream_sa: net::SockAddr,
+    tls: Option<ClientConnection>,
 
     io_buf: u16,
     io_len: u32,
@@ -3721,229 +3732,6 @@ impl Worker {
         *ENABLED.get_or_init(|| std::env::var_os("ARC_DEBUG_UPSTREAM_TLS").is_some())
     }
 
-    fn upstream_read_until_complete<R: Read>(
-        &self,
-        mut reader: R,
-        max_resp: usize,
-        connect_done_ns: u64,
-    ) -> std::result::Result<(Vec<u8>, bool, Option<u64>), H2H1RoundtripError> {
-        let mut resp = Vec::with_capacity(8192);
-        let mut buf = [0u8; 8192];
-        let mut saw_eof = false;
-        let mut response_ms: Option<u64> = None;
-
-        loop {
-            match reader.read(&mut buf) {
-                Ok(0) => {
-                    if Self::upstream_tls_debug_enabled() {
-                        eprintln!("[arc][upstream_tls] stage=read eof=1 bytes={}", resp.len());
-                    }
-                    saw_eof = true;
-                    break;
-                }
-                Ok(n) => {
-                    if Self::upstream_tls_debug_enabled() {
-                        eprintln!(
-                            "[arc][upstream_tls] stage=read chunk={} total={}",
-                            n,
-                            resp.len().saturating_add(n)
-                        );
-                    }
-                    if resp.len().saturating_add(n) > max_resp {
-                        return Err(H2H1RoundtripError::Proto);
-                    }
-                    resp.extend_from_slice(&buf[..n]);
-                }
-                Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
-                Err(e)
-                    if e.kind() == io::ErrorKind::WouldBlock
-                        || e.kind() == io::ErrorKind::TimedOut =>
-                {
-                    if Self::upstream_tls_debug_enabled() {
-                        eprintln!(
-                            "[arc][upstream_tls] stage=read timeout_or_wouldblock kind={:?} bytes={}",
-                            e.kind(),
-                            resp.len()
-                        );
-                    }
-                    break;
-                }
-                Err(e) => {
-                    Self::upstream_tls_debug("read", &e);
-                    return Err(H2H1RoundtripError::Io);
-                }
-            }
-
-            if let Some(hend) = find_header_end(&resp) {
-                if let Ok(head) = parse_response_head(&resp, hend) {
-                    if response_ms.is_none() {
-                        response_ms = Some(
-                            monotonic_nanos()
-                                .saturating_sub(connect_done_ns)
-                                .saturating_div(1_000_000),
-                        );
-                    }
-                    match head.body {
-                        BodyKind::None => {
-                            if Self::upstream_tls_debug_enabled() {
-                                eprintln!("[arc][upstream_tls] stage=read body=none done=1");
-                            }
-                            break;
-                        }
-                        BodyKind::ContentLength { remaining } => {
-                            if resp.len().saturating_sub(hend) >= remaining as usize {
-                                if Self::upstream_tls_debug_enabled() {
-                                    eprintln!(
-                                        "[arc][upstream_tls] stage=read body=content_length done=1 need={} have={}",
-                                        remaining,
-                                        resp.len().saturating_sub(hend)
-                                    );
-                                }
-                                break;
-                            }
-                        }
-                        BodyKind::Chunked(_) => {
-                            if Self::h2_decode_chunked(&resp[hend..])?.is_some() {
-                                if Self::upstream_tls_debug_enabled() {
-                                    eprintln!("[arc][upstream_tls] stage=read body=chunked done=1");
-                                }
-                                break;
-                            }
-                        }
-                        BodyKind::UntilEof => {}
-                    }
-                }
-            }
-        }
-        Ok((resp, saw_eof, response_ms))
-    }
-
-    fn upstream_roundtrip_raw(
-        &self,
-        upstream_id: usize,
-        upstream_addr: SocketAddr,
-        req: &[u8],
-    ) -> std::result::Result<(Vec<u8>, bool, u64, Option<u64>), H2H1RoundtripError> {
-        if self.active_cfg.upstreams.get(upstream_id).is_none() {
-            return Err(H2H1RoundtripError::Proto);
-        }
-
-        let t0 = monotonic_nanos();
-        let mut s = TcpStream::connect_timeout(
-            &upstream_addr,
-            Duration::from_millis(self.active_cfg.timeouts_ms.up_conn.max(1)),
-        )
-        .map_err(|e| {
-            Self::upstream_tls_debug("connect", &e);
-            Self::map_upstream_io_error(&e)
-        })?;
-        let connect_done_ns = monotonic_nanos();
-        let connect_ms = connect_done_ns.saturating_sub(t0).saturating_div(1_000_000);
-        // connect_timeout internally may use nonblocking connect.
-        // Force blocking mode so timeout semantics are predictable.
-        let _ = s.set_nonblocking(false);
-        let _ = s.set_nodelay(true);
-
-        let max_resp = 16 * 1024 * 1024usize;
-
-        if let Some(rt) = self.upstream_tls.get(upstream_id).and_then(|v| v.as_ref()) {
-            let hs_timeout = Duration::from_millis(self.active_cfg.timeouts_ms.up_handshake.max(1));
-            let _ = s.set_write_timeout(Some(hs_timeout));
-            let _ = s.set_read_timeout(Some(hs_timeout));
-
-            let mut tls = ClientConnection::new(rt.config.clone(), rt.server_name.clone())
-                .map_err(|e| {
-                    Self::upstream_tls_debug("client_config", &e);
-                    H2H1RoundtripError::Io
-                })?;
-            while tls.is_handshaking() {
-                tls.complete_io(&mut s).map_err(|e| {
-                    Self::upstream_tls_debug("handshake", &e);
-                    Self::map_upstream_io_error(&e)
-                })?;
-            }
-
-            let _ = s.set_write_timeout(Some(Duration::from_millis(
-                self.active_cfg.timeouts_ms.up_write.max(1),
-            )));
-            let _ = s.set_read_timeout(Some(Duration::from_millis(
-                self.active_cfg.timeouts_ms.up_read.max(1),
-            )));
-
-            let mut stream = rustls::Stream::new(&mut tls, &mut s);
-            stream.write_all(req).map_err(|e| {
-                Self::upstream_tls_debug("write", &e);
-                Self::map_upstream_io_error(&e)
-            })?;
-            stream.flush().map_err(|e| {
-                Self::upstream_tls_debug("flush", &e);
-                Self::map_upstream_io_error(&e)
-            })?;
-
-            let (resp, saw_eof, response_ms) =
-                self.upstream_read_until_complete(stream, max_resp, connect_done_ns)?;
-            return Ok((resp, saw_eof, connect_ms, response_ms));
-        }
-
-        let _ = s.set_write_timeout(Some(Duration::from_millis(
-            self.active_cfg.timeouts_ms.up_write.max(1),
-        )));
-        let _ = s.set_read_timeout(Some(Duration::from_millis(
-            self.active_cfg.timeouts_ms.up_read.max(1),
-        )));
-
-        s.write_all(req)
-            .map_err(|e| Self::map_upstream_io_error(&e))?;
-        let (resp, saw_eof, response_ms) =
-            self.upstream_read_until_complete(s, max_resp, connect_done_ns)?;
-        Ok((resp, saw_eof, connect_ms, response_ms))
-    }
-
-    fn h2_roundtrip_h1(
-        &self,
-        upstream_id: usize,
-        upstream_addr: SocketAddr,
-        req: &[u8],
-    ) -> std::result::Result<(u16, Vec<H2Header>, Vec<u8>, u64, Option<u64>), H2H1RoundtripError>
-    {
-        let (resp, saw_eof, connect_ms, response_ms) =
-            self.upstream_roundtrip_raw(upstream_id, upstream_addr, req)?;
-
-        let hend = find_header_end(&resp).ok_or(H2H1RoundtripError::Proto)?;
-        let head = parse_response_head(&resp, hend).map_err(|_| H2H1RoundtripError::Proto)?;
-        let mut headers = Self::h2_parse_h1_response_headers(&resp[..hend]);
-        let body_raw = &resp[hend..];
-
-        let body = match head.body {
-            BodyKind::None => Vec::new(),
-            BodyKind::ContentLength { remaining } => {
-                if body_raw.len() < remaining as usize {
-                    return Err(H2H1RoundtripError::Timeout);
-                }
-                body_raw[..remaining as usize].to_vec()
-            }
-            BodyKind::Chunked(_) => {
-                let Some(decoded) = Self::h2_decode_chunked(body_raw)? else {
-                    return Err(H2H1RoundtripError::Timeout);
-                };
-                decoded
-            }
-            BodyKind::UntilEof => {
-                if !saw_eof {
-                    return Err(H2H1RoundtripError::Timeout);
-                }
-                body_raw.to_vec()
-            }
-        };
-
-        headers.push(H2Header {
-            name: Bytes::from_static(b"content-length"),
-            value: Bytes::from(body.len().to_string()),
-        });
-
-        Ok((head.status, headers, body, connect_ms, response_ms))
-    }
-
     fn h2_body_to_chain(&mut self, body: &[u8]) -> Option<H2BufChain> {
         if body.is_empty() {
             return Some(H2BufChain::new());
@@ -3980,7 +3768,7 @@ impl Worker {
     }
 
     fn h2_release_task_resources(&mut self, task_key: Key) -> Option<(H2ConnKey, usize)> {
-        let (down, upstream_id, fd, fi, io_buf, req_keepalive, resp_keepalive) = {
+        let (down, upstream_id, fd, fi, io_buf, req_keepalive, resp_keepalive, has_tls) = {
             let task = self.h2_tasks.get_mut(task_key)?;
             (
                 task.down,
@@ -3990,10 +3778,11 @@ impl Worker {
                 task.io_buf,
                 task.req_keepalive,
                 task.resp_keepalive,
+                task.tls.is_some(),
             )
         };
 
-        if should_checkin_upstream_keepalive(req_keepalive, resp_keepalive, fd, fi) {
+        if should_checkin_h2_task_keepalive(req_keepalive, resp_keepalive, has_tls, fd, fi) {
             self.checkin_idle_upstream(
                 upstream_id,
                 IdleUpstream {
@@ -5128,6 +4917,98 @@ impl Worker {
         Ok(())
     }
 
+    fn rewrite_http1_response_with_header_muts(
+        src: &[u8],
+        muts: &[CompiledHeaderMutation],
+        cap: usize,
+    ) -> Option<(Vec<u8>, usize, Vec<u8>)> {
+        let header_end = find_header_end(src)?;
+        let mut line_end = None;
+        for i in 0..header_end.saturating_sub(1) {
+            if src[i] == b'\r' && src[i + 1] == b'\n' {
+                line_end = Some(i + 2);
+                break;
+            }
+        }
+        let line_end = line_end?;
+
+        let mut out = Vec::with_capacity(src.len().saturating_add(64));
+        out.extend_from_slice(&src[..line_end]);
+
+        let hdr_region = &src[line_end..header_end];
+        let mut i = 0usize;
+        while i + 1 < hdr_region.len() {
+            let mut j = i;
+            while j + 1 < hdr_region.len()
+                && !(hdr_region[j] == b'\r' && hdr_region[j + 1] == b'\n')
+            {
+                j += 1;
+            }
+            if j + 1 >= hdr_region.len() {
+                break;
+            }
+            let line = &hdr_region[i..j];
+            i = j + 2;
+            if line.is_empty() {
+                break;
+            }
+            let colon = line.iter().position(|b| *b == b':')?;
+            let name = &line[..colon];
+            if muts.iter().any(|m| match m {
+                CompiledHeaderMutation::Remove { name_lower } => {
+                    name.eq_ignore_ascii_case(name_lower.as_ref())
+                }
+                CompiledHeaderMutation::Set { name_lower, .. } => {
+                    name.eq_ignore_ascii_case(name_lower.as_ref())
+                }
+                CompiledHeaderMutation::Add { .. } => false,
+            }) {
+                continue;
+            }
+            out.extend_from_slice(line);
+            out.extend_from_slice(b"\r\n");
+        }
+
+        for m in muts {
+            if let CompiledHeaderMutation::Set { name, value, .. } = m {
+                out.extend_from_slice(name.as_ref());
+                out.extend_from_slice(b": ");
+                out.extend_from_slice(value.as_ref());
+                out.extend_from_slice(b"\r\n");
+            }
+        }
+        for m in muts {
+            if let CompiledHeaderMutation::Add { name, value, .. } = m {
+                out.extend_from_slice(name.as_ref());
+                out.extend_from_slice(b": ");
+                out.extend_from_slice(value.as_ref());
+                out.extend_from_slice(b"\r\n");
+            }
+        }
+        out.extend_from_slice(b"\r\n");
+
+        let new_header_end = out.len();
+        if new_header_end > cap {
+            return None;
+        }
+
+        let body = &src[header_end..];
+        let mut resp_stash = Vec::new();
+        if new_header_end.saturating_add(body.len()) > cap {
+            let overflow = new_header_end + body.len() - cap;
+            if overflow > body.len() || overflow > RESP_STASH_CAP {
+                return None;
+            }
+            let keep = body.len() - overflow;
+            out.extend_from_slice(&body[..keep]);
+            resp_stash.extend_from_slice(&body[keep..]);
+        } else {
+            out.extend_from_slice(body);
+        }
+
+        Some((out, new_header_end, resp_stash))
+    }
+
     fn http1_apply_response_header_muts(
         &mut self,
         key: Key,
@@ -5158,85 +5039,12 @@ impl Worker {
 
         let src =
             unsafe { std::slice::from_raw_parts(self.bufs.ptr(buf_id) as *const u8, send_len) };
-        let Some(header_end) = find_header_end(src) else {
+        let Some((out, new_header_end, resp_stash)) =
+            Self::rewrite_http1_response_with_header_muts(src, muts.as_ref(), self.bufs.buf_size())
+        else {
             self.queue_error_response(key, RESP_502)?;
             return Ok(None);
         };
-
-        let mut line_end = None;
-        for i in 0..header_end.saturating_sub(1) {
-            if src[i] == b'\r' && src[i + 1] == b'\n' {
-                line_end = Some(i + 2);
-                break;
-            }
-        }
-        let Some(line_end) = line_end else {
-            self.queue_error_response(key, RESP_502)?;
-            return Ok(None);
-        };
-
-        let mut out = Vec::with_capacity(send_len.saturating_add(64));
-        out.extend_from_slice(&src[..line_end]);
-
-        let hdr_region = &src[line_end..header_end];
-        let mut i = 0usize;
-        while i + 1 < hdr_region.len() {
-            let mut j = i;
-            while j + 1 < hdr_region.len()
-                && !(hdr_region[j] == b'\r' && hdr_region[j + 1] == b'\n')
-            {
-                j += 1;
-            }
-            if j + 1 >= hdr_region.len() {
-                break;
-            }
-            let line = &hdr_region[i..j];
-            i = j + 2;
-            if line.is_empty() {
-                break;
-            }
-            let Some(colon) = line.iter().position(|b| *b == b':') else {
-                continue;
-            };
-            let name = &line[..colon];
-            if muts.iter().any(|m| match m {
-                CompiledHeaderMutation::Remove { name_lower } => {
-                    name.eq_ignore_ascii_case(name_lower.as_ref())
-                }
-                CompiledHeaderMutation::Set { name_lower, .. } => {
-                    name.eq_ignore_ascii_case(name_lower.as_ref())
-                }
-                CompiledHeaderMutation::Add { .. } => false,
-            }) {
-                continue;
-            }
-            out.extend_from_slice(line);
-            out.extend_from_slice(b"\r\n");
-        }
-
-        for m in muts.iter() {
-            if let CompiledHeaderMutation::Set { name, value, .. } = m {
-                out.extend_from_slice(name.as_ref());
-                out.extend_from_slice(b": ");
-                out.extend_from_slice(value.as_ref());
-                out.extend_from_slice(b"\r\n");
-            }
-        }
-        for m in muts.iter() {
-            if let CompiledHeaderMutation::Add { name, value, .. } = m {
-                out.extend_from_slice(name.as_ref());
-                out.extend_from_slice(b": ");
-                out.extend_from_slice(value.as_ref());
-                out.extend_from_slice(b"\r\n");
-            }
-        }
-        out.extend_from_slice(b"\r\n");
-        out.extend_from_slice(&src[header_end..send_len]);
-
-        if out.len() > self.bufs.buf_size() {
-            self.queue_error_response(key, RESP_502)?;
-            return Ok(None);
-        }
 
         unsafe {
             let dst = self.bufs.ptr(buf_id);
@@ -5247,8 +5055,44 @@ impl Worker {
             return Ok(None);
         };
         conn.buf_len = out.len() as u32;
-        conn.header_end = (out.len() - (send_len - header_end)) as u32;
+        conn.header_end = new_header_end as u32;
+        conn.resp_stash_len = resp_stash.len() as u32;
+        if !resp_stash.is_empty() {
+            conn.resp_stash[..resp_stash.len()].copy_from_slice(resp_stash.as_slice());
+        }
         Ok(Some(out.len()))
+    }
+
+    fn schedule_response_stash_write(&mut self, key: Key) -> Result<bool> {
+        let (buf_id, pending_len) = {
+            let Some(conn) = self.conns.get_mut(key) else {
+                return Ok(false);
+            };
+            if conn.buf == INVALID_BUF || conn.resp_stash_len == 0 {
+                return Ok(false);
+            }
+            let pending_len = conn.resp_stash_len as usize;
+            if pending_len > RESP_STASH_CAP || pending_len > self.bufs.buf_size() {
+                self.queue_error_response(key, RESP_502)?;
+                return Ok(false);
+            }
+            let buf_id = conn.buf;
+            unsafe {
+                std::ptr::copy_nonoverlapping(
+                    conn.resp_stash.as_ptr(),
+                    self.bufs.ptr(buf_id),
+                    pending_len,
+                );
+            }
+            conn.resp_stash_len = 0;
+            conn.buf_off = 0;
+            conn.buf_len = pending_len as u32;
+            conn.state = ConnState::CliWriteBody;
+            (buf_id, pending_len as u32)
+        };
+        let _ = buf_id;
+        self.schedule_client_write(key, pending_len)?;
+        Ok(true)
     }
 
     fn http1_upsert_header(&mut self, key: Key, name: &[u8], value: &[u8]) -> Result<()> {
@@ -5829,13 +5673,13 @@ impl Worker {
                 return Ok(());
             };
             task.state = H2H1TaskState::WritingReq;
+            let timeout_ms = if task.tls.as_ref().map(|tls| tls.is_handshaking()).unwrap_or(false) {
+                self.active_cfg.timeouts_ms.up_handshake.max(1)
+            } else {
+                self.active_cfg.timeouts_ms.up_write.max(1)
+            };
             let now = monotonic_nanos();
-            task.deadline_ns = now.saturating_add(
-                self.active_cfg
-                    .timeouts_ms
-                    .up_write
-                    .saturating_mul(1_000_000),
-            );
+            task.deadline_ns = now.saturating_add(timeout_ms.saturating_mul(1_000_000));
             self.h2_timeout_wheel.push(task.deadline_ns, task_key);
             (task.upstream_fi, task.io_buf)
         };
@@ -5860,8 +5704,11 @@ impl Worker {
                 return Ok(());
             };
             task.state = H2H1TaskState::ReadingResp;
-            // H2->H1 适配层在高并发下更需要快速失败，避免个别挂起回源占满任务槽位。
-            let read_timeout_ms = self.active_cfg.timeouts_ms.up_read.min(10_000).max(1);
+            let read_timeout_ms = if task.tls.as_ref().map(|tls| tls.is_handshaking()).unwrap_or(false) {
+                self.active_cfg.timeouts_ms.up_handshake.max(1)
+            } else {
+                self.active_cfg.timeouts_ms.up_read.min(10_000).max(1)
+            };
             let now = monotonic_nanos();
             task.deadline_ns = now.saturating_add(read_timeout_ms.saturating_mul(1_000_000));
             self.h2_timeout_wheel.push(task.deadline_ns, task_key);
@@ -5883,6 +5730,45 @@ impl Worker {
     }
 
     fn h2_task_prepare_next_write_chunk(&mut self, task_key: Key) -> Result<bool> {
+        let uses_tls = match self.h2_tasks.get_mut(task_key) {
+            Some(task) => task.tls.is_some(),
+            None => return Ok(false),
+        };
+
+        if uses_tls {
+            let io_buf = match self.h2_tasks.get_mut(task_key) {
+                Some(task) => task.io_buf,
+                None => return Ok(false),
+            };
+            let cap = self.bufs.buf_size();
+            let ptr = self.bufs.ptr(io_buf);
+
+            let Some(task) = self.h2_tasks.get_mut(task_key) else {
+                return Ok(false);
+            };
+            if task.io_off < task.io_len {
+                return Ok(true);
+            }
+
+            let Some(tls) = task.tls.as_mut() else {
+                return Ok(false);
+            };
+            if !tls.wants_write() {
+                task.io_off = 0;
+                task.io_len = 0;
+                return Ok(false);
+            }
+
+            let mut writer = RawBufWriter::new(ptr, cap);
+            tls.write_tls(&mut writer).map_err(|e| {
+                Self::upstream_tls_debug("write", &e);
+                ArcError::io("write h2 tls upstream buffer", e)
+            })?;
+            task.io_off = 0;
+            task.io_len = writer.written() as u32;
+            return Ok(task.io_len > 0);
+        }
+
         let cap = self.bufs.buf_size();
         let (io_buf, chunk) = {
             let Some(task) = self.h2_tasks.get_mut(task_key) else {
@@ -6006,10 +5892,53 @@ impl Worker {
         let up_addr = self
             .upstream_runtime_addr(upstream_id)
             .ok_or_else(|| ArcError::config("invalid runtime upstream addr".to_string()))?;
+        let upstream_tls = self
+            .upstream_tls
+            .get(upstream_id)
+            .and_then(|v| v.as_ref())
+            .map(|rt| (rt.config.clone(), rt.server_name.clone()));
+        let use_tls = upstream_tls.is_some();
         let now_ns = monotonic_nanos();
         let (reused_idle, upstream_fd, upstream_fi, connect_done_ns) =
-            if let Some(idle) = self.checkout_idle_upstream(upstream_id, now_ns) {
-                (true, idle.fd, idle.fi, Some(now_ns))
+            if !use_tls {
+                if let Some(idle) = self.checkout_idle_upstream(upstream_id, now_ns) {
+                    (true, idle.fd, idle.fi, Some(now_ns))
+                } else {
+                    if !self.upstream_try_acquire_connection_slot(upstream_id) {
+                        return Err(ArcError::internal("upstream max_connections reached"));
+                    }
+
+                    let upstream_fd = match net::create_client_socket(&up_addr) {
+                        Ok(fd) => fd,
+                        Err(e) => {
+                            self.upstream_release_connection_slot(upstream_id);
+                            return Err(ArcError::io("h2 stream socket", e));
+                        }
+                    };
+                    if self.active_cfg.linger_ms > 0 {
+                        let _ = net::set_linger(upstream_fd, self.active_cfg.linger_ms);
+                    }
+
+                    let up_slot = match self.files.alloc() {
+                        Some(s) => s,
+                        None => {
+                            close_fd(upstream_fd);
+                            self.upstream_release_connection_slot(upstream_id);
+                            return Err(ArcError::internal(
+                                "no fixed-file slot for h2 stream upstream",
+                            ));
+                        }
+                    };
+
+                    self.files.table[up_slot as usize] = upstream_fd;
+                    if let Err(e) = self.uring.update_files(up_slot, &[upstream_fd]) {
+                        self.files.free_slot(up_slot);
+                        close_fd(upstream_fd);
+                        self.upstream_release_connection_slot(upstream_id);
+                        return Err(ArcError::io("update_files(h2 stream upstream)", e));
+                    }
+                    (false, upstream_fd, up_slot as i32, None)
+                }
             } else {
                 if !self.upstream_try_acquire_connection_slot(upstream_id) {
                     return Err(ArcError::internal("upstream max_connections reached"));
@@ -6032,7 +5961,7 @@ impl Worker {
                         close_fd(upstream_fd);
                         self.upstream_release_connection_slot(upstream_id);
                         return Err(ArcError::internal(
-                            "no fixed-file slot for h2 stream upstream",
+                            "no fixed-file slot for h2 tls stream upstream",
                         ));
                     }
                 };
@@ -6042,7 +5971,7 @@ impl Worker {
                     self.files.free_slot(up_slot);
                     close_fd(upstream_fd);
                     self.upstream_release_connection_slot(upstream_id);
-                    return Err(ArcError::io("update_files(h2 stream upstream)", e));
+                    return Err(ArcError::io("update_files(h2 tls stream upstream)", e));
                 }
                 (false, upstream_fd, up_slot as i32, None)
             };
@@ -6071,6 +6000,65 @@ impl Worker {
                 }
                 return Err(ArcError::internal("no fixed buffer for h2 stream upstream"));
             }
+        };
+
+        let mut req = req;
+        let tls = if let Some((config, server_name)) = upstream_tls {
+            let mut tls = match ClientConnection::new(config, server_name) {
+                Ok(v) => v,
+                Err(e) => {
+                    Self::upstream_tls_debug("client_config", &e);
+                    self.bufs.free(io_buf);
+                    if reused_idle {
+                        self.drop_idle_upstream(IdleUpstream {
+                            fd: upstream_fd,
+                            fi: upstream_fi,
+                            upstream_id,
+                            ts_ns: now_ns,
+                            watch_tag: 0,
+                        });
+                    } else {
+                        if upstream_fi >= 0 {
+                            let slot = upstream_fi as u32;
+                            let _ = self.uring.update_files(slot, &[-1]);
+                            self.files.free_slot(slot);
+                        }
+                        if upstream_fd >= 0 {
+                            close_fd(upstream_fd);
+                            self.upstream_release_connection_slot(upstream_id);
+                        }
+                    }
+                    return Err(ArcError::internal("failed to build h2 upstream tls client"));
+                }
+            };
+            if let Err(e) = tls.writer().write_all(req.as_slice()) {
+                Self::upstream_tls_debug("write", &e);
+                self.bufs.free(io_buf);
+                if reused_idle {
+                    self.drop_idle_upstream(IdleUpstream {
+                        fd: upstream_fd,
+                        fi: upstream_fi,
+                        upstream_id,
+                        ts_ns: now_ns,
+                        watch_tag: 0,
+                    });
+                } else {
+                    if upstream_fi >= 0 {
+                        let slot = upstream_fi as u32;
+                        let _ = self.uring.update_files(slot, &[-1]);
+                        self.files.free_slot(slot);
+                    }
+                    if upstream_fd >= 0 {
+                        close_fd(upstream_fd);
+                        self.upstream_release_connection_slot(upstream_id);
+                    }
+                }
+                return Err(ArcError::io("buffer h2 request into upstream tls client", e));
+            }
+            req.clear();
+            Some(tls)
+        } else {
+            None
         };
 
         let task_key = match self.h2_tasks.alloc() {
@@ -6113,12 +6101,13 @@ impl Worker {
             upstream_fd,
             upstream_fi,
             upstream_sa: net::SockAddr::from_socket_addr(&up_addr),
+            tls,
             io_buf,
             io_len: 0,
             io_off: 0,
             req,
             req_sent: 0,
-            req_keepalive: true,
+            req_keepalive: !use_tls,
             resp_keepalive: false,
             resp: Vec::with_capacity(8192),
             status: 502,
@@ -6216,6 +6205,11 @@ impl Worker {
     }
 
     fn on_h2_task_write(&mut self, task_key: Key, res: i32) -> Result<()> {
+        let uses_tls = match self.h2_tasks.get_mut(task_key) {
+            Some(task) => task.tls.is_some(),
+            None => return Ok(()),
+        };
+
         if res < 0 {
             let retry = is_retryable_io_error(Some(-res));
             if retry {
@@ -6234,6 +6228,35 @@ impl Worker {
         }
 
         let wrote = res as u32;
+        if uses_tls {
+            let mut next_write: Option<(u32, u32)> = None;
+            {
+                let Some(task) = self.h2_tasks.get_mut(task_key) else {
+                    return Ok(());
+                };
+                task.io_off = task.io_off.saturating_add(wrote);
+                if task.io_off < task.io_len {
+                    next_write = Some((task.io_off, task.io_len.saturating_sub(task.io_off)));
+                } else {
+                    task.io_off = 0;
+                    task.io_len = 0;
+                }
+            }
+
+            if let Some((off, len)) = next_write {
+                return self.h2_schedule_task_write(task_key, off, len);
+            }
+
+            if !self.h2_task_prepare_next_write_chunk(task_key)? {
+                return self.h2_schedule_task_read(task_key);
+            }
+            let len = match self.h2_tasks.get_mut(task_key) {
+                Some(task) => task.io_len,
+                None => return Ok(()),
+            };
+            return self.h2_schedule_task_write(task_key, 0, len);
+        }
+
         let mut need_continue_chunk = false;
         let mut need_next_chunk = false;
         let mut finished_req = false;
@@ -6288,6 +6311,11 @@ impl Worker {
     }
 
     fn on_h2_task_read(&mut self, task_key: Key, res: i32) -> Result<()> {
+        let uses_tls = match self.h2_tasks.get_mut(task_key) {
+            Some(task) => task.tls.is_some(),
+            None => return Ok(()),
+        };
+
         if res < 0 {
             if is_retryable_io_error(Some(-res)) {
                 return self.h2_schedule_task_read(task_key);
@@ -6298,6 +6326,73 @@ impl Worker {
         if res == 0 {
             if let Some(task) = self.h2_tasks.get_mut(task_key) {
                 task.saw_eof = true;
+            }
+        } else if uses_tls {
+            let n = res as usize;
+            let io_buf = match self.h2_tasks.get_mut(task_key) {
+                Some(task) => task.io_buf,
+                None => return Ok(()),
+            };
+            let p = self.bufs.ptr(io_buf) as *const u8;
+
+            {
+                let Some(task) = self.h2_tasks.get_mut(task_key) else {
+                    return Ok(());
+                };
+                let Some(tls) = task.tls.as_mut() else {
+                    return self.h2_fail_task(task_key, 502);
+                };
+                let mut rdr = RawBufReader::new(p, n);
+                if let Err(e) = tls.read_tls(&mut rdr) {
+                    Self::upstream_tls_debug("read", &e);
+                    return self.h2_fail_task(task_key, 502);
+                }
+                if let Err(e) = tls.process_new_packets() {
+                    Self::upstream_tls_debug("handshake", &e);
+                    return self.h2_fail_task(task_key, 502);
+                }
+            }
+
+            let mut drained = 0usize;
+            let mut buf = [0u8; 8192];
+            loop {
+                if drained >= UP_MTLS_PLAIN_DRAIN_BUDGET {
+                    break;
+                }
+                let read_res = {
+                    let Some(task) = self.h2_tasks.get_mut(task_key) else {
+                        return Ok(());
+                    };
+                    let Some(tls) = task.tls.as_mut() else {
+                        return self.h2_fail_task(task_key, 502);
+                    };
+                    tls.reader().read(&mut buf)
+                };
+                match read_res {
+                    Ok(0) => break,
+                    Ok(m) => {
+                        drained += m;
+                        let too_large = {
+                            let Some(task) = self.h2_tasks.get_mut(task_key) else {
+                                return Ok(());
+                            };
+                            if task.resp.len().saturating_add(m) > UP_MTLS_MAX_RESP {
+                                true
+                            } else {
+                                task.resp.extend_from_slice(&buf[..m]);
+                                false
+                            }
+                        };
+                        if too_large {
+                            return self.h2_fail_task(task_key, 502);
+                        }
+                    }
+                    Err(e) if e.kind() == io::ErrorKind::WouldBlock => break,
+                    Err(e) => {
+                        Self::upstream_tls_debug("read", &e);
+                        return self.h2_fail_task(task_key, 502);
+                    }
+                }
             }
         } else {
             let n = res as u32;
@@ -6348,6 +6443,16 @@ impl Worker {
             Ok(None) => {
                 if res == 0 {
                     self.h2_fail_task(task_key, 502)
+                } else if uses_tls {
+                    if !self.h2_task_prepare_next_write_chunk(task_key)? {
+                        self.h2_schedule_task_read(task_key)
+                    } else {
+                        let len = match self.h2_tasks.get_mut(task_key) {
+                            Some(task) => task.io_len,
+                            None => return Ok(()),
+                        };
+                        self.h2_schedule_task_write(task_key, 0, len)
+                    }
                 } else {
                     self.h2_schedule_task_read(task_key)
                 }
@@ -6619,50 +6724,6 @@ impl Worker {
                 request_id_decision.force_set,
                 request_id_decision.original.as_deref(),
             );
-            if self
-                .upstream_tls
-                .get(upstream_id)
-                .and_then(|v| v.as_ref())
-                .is_some()
-            {
-                h2_log_timing(sid, "upstream_connect_or_reuse_start", started_ns);
-                if !self.upstream_try_acquire_connection_slot(upstream_id) {
-                    let _ = down.send_response_headers(sid, 503, vec![], true);
-                    Self::h2_emit_access_log_opt(access_log.take(), 503, started_ns);
-                    continue;
-                }
-                let roundtrip = self.h2_roundtrip_h1(upstream_id, upstream_addr, &req);
-                self.upstream_release_connection_slot(upstream_id);
-                match roundtrip {
-                    Ok((status, mut headers, body, connect_ms, response_ms)) => {
-                        self.mark_upstream_success(upstream_id);
-                        Self::apply_h2_response_header_muts(
-                            &mut headers,
-                            response_header_muts.as_ref(),
-                        );
-                        if let Some(log) = access_log.as_mut() {
-                            log.upstream_connect_ms = Some(connect_ms);
-                            log.upstream_response_ms = response_ms;
-                        }
-                        h2_log_timing(sid, "upstream_response_ready", started_ns);
-                        h2_log_timing(sid, "downstream_response_emit", started_ns);
-                        self.h2_send_full_response_on_down(down, sid, status, headers, &body);
-                        h2_log_timing(sid, "downstream_response_flushed", started_ns);
-                        Self::h2_emit_access_log_opt(access_log.take(), status, started_ns);
-                    }
-                    Err(H2H1RoundtripError::Timeout) => {
-                        self.mark_upstream_failure(upstream_id);
-                        let _ = down.send_response_headers(sid, 504, vec![], true);
-                        Self::h2_emit_access_log_opt(access_log.take(), 504, started_ns);
-                    }
-                    Err(_) => {
-                        self.mark_upstream_failure(upstream_id);
-                        let _ = down.send_response_headers(sid, 502, vec![], true);
-                        Self::h2_emit_access_log_opt(access_log.take(), 502, started_ns);
-                    }
-                }
-                continue;
-            }
             match self.h2_spawn_or_queue_h1_task(
                 h2_down_key,
                 sid,
@@ -8331,6 +8392,13 @@ impl Worker {
         // finished writing response bytes
         match conn.state {
             ConnState::CliWriteHeadAndMaybeBody => {
+                if conn.resp_stash_len > 0 {
+                    let _ = conn;
+                    if self.schedule_response_stash_write(key)? {
+                        return Ok(());
+                    }
+                    return Ok(());
+                }
                 // We forwarded response head+maybe body bytes; now we need to decide next step.
                 if conn.resp_body.is_done() {
                     self.metrics.resp_total.fetch_add(1, Ordering::Relaxed);
@@ -8345,6 +8413,13 @@ impl Worker {
                 Ok(())
             }
             ConnState::CliWriteBody => {
+                if conn.resp_stash_len > 0 {
+                    let _ = conn;
+                    if self.schedule_response_stash_write(key)? {
+                        return Ok(());
+                    }
+                    return Ok(());
+                }
                 if conn.resp_body.is_done() {
                     self.metrics.resp_total.fetch_add(1, Ordering::Relaxed);
                     let _ = conn;
@@ -9859,6 +9934,23 @@ fn should_checkin_upstream_keepalive(
 }
 
 #[inline]
+fn should_checkin_h2_task_keepalive(
+    req_keepalive: bool,
+    resp_keepalive: bool,
+    has_tls: bool,
+    upstream_fd: RawFd,
+    upstream_fi: i32,
+) -> bool {
+    !has_tls
+        && should_checkin_upstream_keepalive(
+            req_keepalive,
+            resp_keepalive,
+            upstream_fd,
+            upstream_fi,
+        )
+}
+
+#[inline]
 fn reset_conn_for_next_keepalive_request(conn: &mut Conn) {
     conn.state = ConnState::CliReadHead;
     conn.buf_len = 0;
@@ -9888,6 +9980,7 @@ fn reset_conn_for_next_keepalive_request(conn: &mut Conn) {
     conn.tried_len = 0;
     conn.retry_wakeup_ns = 0;
     conn.replay_len = 0;
+    conn.resp_stash_len = 0;
     conn.upstream_sa = None;
     conn.request_id = 0;
     conn.request_id_text.clear();
@@ -10867,6 +10960,8 @@ mod tests {
         assert!(!should_checkin_upstream_keepalive(true, true, -1, 3));
         assert!(!should_checkin_upstream_keepalive(true, true, 10, -1));
         assert!(!should_checkin_upstream_keepalive(true, false, 10, 3));
+        assert!(should_checkin_h2_task_keepalive(true, true, false, 10, 3));
+        assert!(!should_checkin_h2_task_keepalive(true, true, true, 10, 3));
     }
 
     #[test]
@@ -11143,6 +11238,58 @@ mod tests {
         // keepalive should preserve connection identity
         assert_eq!(c.client_ip, "198.51.100.88");
         assert_eq!(c.client_port, 44321);
+    }
+
+    #[test]
+    fn h2_request_collector_releases_pending_body_on_conn_error() {
+        struct MockBufOps {
+            released: Vec<u16>,
+        }
+
+        impl H2BufOpsTrait for MockBufOps {
+            fn slice<'a>(&'a self, _buf_id: u16, _off: u32, _len: u32) -> &'a [u8] {
+                &[]
+            }
+
+            fn release(&mut self, buf_id: u16) {
+                self.released.push(buf_id);
+            }
+
+            fn retain(&mut self, _buf_id: u16) {}
+        }
+
+        let mut collector = H2RequestCollector::default();
+        collector.on_request_headers(
+            H2ConnKey::new(1, 1),
+            3,
+            false,
+            H2RequestHead {
+                method: Bytes::from_static(b"POST"),
+                authority: Some(Bytes::from_static(b"example.com")),
+                path: Some(Bytes::from_static(b"/upload")),
+                headers: vec![],
+            },
+        );
+        let mut body = H2BufChain::new();
+        body.push_seg(7, 0, 16);
+        body.push_seg(8, 0, 24);
+        collector.on_request_data(H2ConnKey::new(1, 1), 3, false, body);
+        collector.on_conn_error(
+            H2ConnKey::new(1, 1),
+            arc_proto_h2::error::H2Error::new(
+                arc_proto_h2::error::H2Code::ProtocolError,
+                "boom",
+            ),
+        );
+
+        let mut ops = MockBufOps {
+            released: Vec::new(),
+        };
+        collector.release_dropped(&mut ops);
+
+        assert_eq!(ops.released, vec![7, 8]);
+        assert!(collector.pending.is_empty());
+        assert!(collector.ready.is_empty());
     }
 
     #[test]
@@ -11495,5 +11642,34 @@ mod tests {
             state,
             HttpBodyState::ContentLength { remaining: 5 }
         ));
+    }
+
+    #[test]
+    fn response_header_mutation_stashes_body_tail_when_first_chunk_is_full() {
+        let muts = vec![CompiledHeaderMutation::Set {
+            name: Bytes::from_static(b"Cache-Control"),
+            name_lower: Bytes::from_static(b"cache-control"),
+            value: Bytes::from_static(b"no-store, no-cache, must-revalidate"),
+        }];
+        let cap = 128usize;
+        let mut resp = b"HTTP/1.1 200 OK\r\nContent-Length: 256\r\n\r\n".to_vec();
+        resp.extend(std::iter::repeat_n(b'a', cap.saturating_sub(resp.len())));
+
+        let original_hend = find_header_end(resp.as_slice()).expect("original header end");
+        let original_body = resp[original_hend..].to_vec();
+
+        let (rewritten, new_hend, resp_stash) =
+            Worker::rewrite_http1_response_with_header_muts(resp.as_slice(), muts.as_slice(), cap)
+                .expect("rewrite with stash");
+
+        assert_eq!(rewritten.len(), cap);
+        assert!(!resp_stash.is_empty());
+        assert!(rewritten[..new_hend]
+            .windows(b"Cache-Control: no-store, no-cache, must-revalidate".len())
+            .any(|w| w == b"Cache-Control: no-store, no-cache, must-revalidate"));
+
+        let mut rebuilt_body = rewritten[new_hend..].to_vec();
+        rebuilt_body.extend_from_slice(resp_stash.as_slice());
+        assert_eq!(rebuilt_body, original_body);
     }
 }
